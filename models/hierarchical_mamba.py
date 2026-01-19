@@ -81,9 +81,14 @@ class MultiScalePatchEmbed(nn.Module):
         img_size: int = 224,
         in_channels: int = 3,
         embed_dim: int = 96,
-        scales: List[int] = [4, 8, 16],
+        scales: Optional[List[int]] = None,
     ):
         super().__init__()
+        
+        # Handle mutable default argument
+        if scales is None:
+            scales = [4, 8, 16]
+        
         self.img_size = img_size
         self.embed_dim = embed_dim
         self.scales = scales
@@ -241,7 +246,7 @@ class HierarchicalMambaBackbone(nn.Module):
         img_size: int = 224,
         in_channels: int = 3,
         embed_dim: int = 96,
-        depths: List[int] = [2, 2, 4],
+        depths: Optional[List[int]] = None,
         dims: Optional[List[int]] = None,
         d_state: int = 16,
         d_conv: int = 4,
@@ -252,6 +257,10 @@ class HierarchicalMambaBackbone(nn.Module):
         use_multi_scale_embed: bool = True,
     ):
         super().__init__()
+        
+        # Handle mutable default arguments
+        if depths is None:
+            depths = [2, 2, 4]
         
         self.num_stages = len(depths)
         dims = dims or [embed_dim * (2 ** i) for i in range(self.num_stages)]

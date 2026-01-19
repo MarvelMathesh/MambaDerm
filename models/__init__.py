@@ -1,6 +1,6 @@
 """MambaDerm Models Package."""
 
-from .mambaderm import MambaDerm
+from .mambaderm import MambaDerm, MambaDermLite
 from .mamba_block import VisionMambaBlock, VMambaLayer
 from .hierarchical_mamba import (
     HierarchicalMambaBackbone,
@@ -13,6 +13,7 @@ from .local_global_gate import LocalGlobalGate
 
 __all__ = [
     "MambaDerm",
+    "MambaDermLite",
     "VisionMambaBlock",
     "VMambaLayer",
     "HierarchicalMambaBackbone",
@@ -22,5 +23,3 @@ __all__ = [
     "TabularEncoder",
     "LocalGlobalGate",
 ]
-
-

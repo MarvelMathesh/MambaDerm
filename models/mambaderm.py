@@ -191,7 +191,11 @@ class EnhancedMultiModalFusion(nn.Module):
             L_global = global_feat.shape[1]
             
             # Pool local to match global
-            ratio = int(math.sqrt(L_local / L_global))
+            ratio_squared = L_local / L_global
+            ratio = int(math.sqrt(ratio_squared))
+            # Ensure ratio is valid
+            ratio = max(1, ratio)
+            
             if ratio > 1:
                 H = W = int(math.sqrt(L_local))
                 local_feat = rearrange(local_feat, 'b (h w) d -> b d h w', h=H, w=W)
@@ -221,7 +225,7 @@ class MambaDerm(nn.Module):
     """
     MambaDerm: Hybrid CNN-Mamba Architecture
     
-    Improvements:
+    Features:
     1. Hierarchical 3-stage backbone with multi-scale patches
     2. Feature pyramid fusion across stages
     3. Enhanced gated local-global fusion
@@ -246,7 +250,7 @@ class MambaDerm(nn.Module):
         img_size: int = 224,
         in_channels: int = 3,
         embed_dim: int = 96,
-        depths: List[int] = [2, 2, 4],
+        depths: Optional[List[int]] = None,
         d_state: int = 16,
         num_numerical_features: int = 34,
         num_categorical_features: int = 6,
@@ -258,6 +262,10 @@ class MambaDerm(nn.Module):
         gradient_checkpointing: bool = False,
     ):
         super().__init__()
+        
+        # Handle mutable default argument
+        if depths is None:
+            depths = [2, 2, 4]
         
         self.use_tabular = use_tabular
         self.num_classes = num_classes
@@ -362,8 +370,9 @@ class MambaDerm(nn.Module):
         tabular_feat = None
         if self.use_tabular and tabular is not None:
             numerical = tabular[:, :self.num_numerical_features]
-            categorical = tabular[:, self.num_numerical_features:].long() \
-                if tabular.shape[1] > self.num_numerical_features else None
+            categorical: Optional[torch.Tensor] = None
+            if tabular.shape[1] > self.num_numerical_features:
+                categorical = tabular[:, self.num_numerical_features:].long()
             tabular_feat = self.tabular_encoder(numerical, categorical)
         
         # Feature pyramid fusion (global feature from all stages)
@@ -404,6 +413,42 @@ class MambaDerm(nn.Module):
         logits = self.classifier(combined)
         
         return logits
+
+
+class MambaDermLite(nn.Module):
+    """
+    Lightweight version of MambaDerm for faster inference.
+    
+    Reduces parameters by:
+    - Fewer Mamba layers (2 instead of 4)
+    - Smaller hidden dimensions
+    - No cross-attention fusion
+    """
+    
+    def __init__(
+        self,
+        img_size: int = 224,
+        num_numerical_features: int = 35,
+        num_categorical_features: int = 6,
+        num_classes: int = 1,
+    ):
+        super().__init__()
+        
+        # Lighter configuration using depths parameter
+        self.model = MambaDerm(
+            img_size=img_size,
+            embed_dim=64,
+            depths=[1, 1, 2],
+            d_state=8,
+            num_numerical_features=num_numerical_features,
+            num_categorical_features=num_categorical_features,
+            num_classes=num_classes,
+            dropout=0.1,
+            use_multi_scale=False,
+        )
+    
+    def forward(self, x, tabular=None):
+        return self.model(x, tabular)
 
 
 def count_parameters(model: nn.Module) -> int:

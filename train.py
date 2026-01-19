@@ -8,7 +8,6 @@ Training infrastructure with:
 - Learning rate warmup + cosine decay
 - Gradient checkpointing support
 - Proper logging and checkpointing
-
 """
 
 import argparse
@@ -67,7 +66,7 @@ class EarlyStopping:
         self.min_delta = min_delta
         self.mode = mode
         self.counter = 0
-        self.best_score = None
+        self.best_score: Optional[float] = None
         self.early_stop = False
     
     def __call__(self, score: float) -> bool:
@@ -105,7 +104,7 @@ def get_args():
     parser.add_argument('--fold', type=int, default=0)
     parser.add_argument('--n_folds', type=int, default=5)
     
-    # Model
+    # Model architecture
     parser.add_argument('--img_size', type=int, default=224)
     parser.add_argument('--embed_dim', type=int, default=96)
     parser.add_argument('--depths', type=int, nargs='+', default=[2, 2, 4])
@@ -259,7 +258,7 @@ def train_epoch(
         
         # Apply MixUp/CutMix
         if mixup_fn is not None and model.training:
-            images, targets, tabular, lam = mixup_fn(images, targets, tabular)
+            images, targets, tabular, _ = mixup_fn(images, targets, tabular)
         
         # Mixed precision forward
         with autocast('cuda', enabled=args.use_amp):
@@ -381,7 +380,7 @@ def main():
     
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    print(f"MambaDerm - World-Class Training")
+    print(f"MambaDerm - Training")
     print("=" * 60)
     
     checkpoint_dir = Path(args.checkpoint_dir) / f"fold_{args.fold}"
