@@ -223,7 +223,7 @@ class EnhancedMultiModalFusion(nn.Module):
 
 class MambaDerm(nn.Module):
     """
-    MambaDerm: Hybrid CNN-Mamba Architecture
+    MambaDerm: World-Class Hybrid CNN-Mamba Architecture
     
     Features:
     1. Hierarchical 3-stage backbone with multi-scale patches

@@ -60,44 +60,59 @@ env.bak/
 venv.bak/
 
 # IDE
-.vscode/
 .idea/
+.vscode/
 *.swp
 *.swo
 *~
+.spyderproject
+.spyproject
 
 # Jupyter Notebook
-.ipynb_checkpoints
+.ipynb_checkpoints/
+*.ipynb
 
-# pyenv
-.python-version
-
-# Model checkpoints and logs
-checkpoints/
-logs/
-runs/
-wandb/
+# PyTorch
 *.pt
 *.pth
 *.ckpt
 
-# Data files (large files - download separately)
+# Datasets - DO NOT COMMIT
+skin-cancer-mnist-ham10000/
+HAM10000_images*/
+isic-2024-challenge/
+data/raw/
+data/processed/
 *.hdf5
 *.h5
 *.csv
-*.parquet
-data/
-isic-2024-challenge/
 
-# OS files
+# Checkpoints - DO NOT COMMIT
+checkpoints/
+checkpoints_ham10000/
+runs/
+logs/
+wandb/
+outputs/
+
+# Model artifacts
+*.onnx
+*.tflite
+
+# System
 .DS_Store
 Thumbs.db
-
-# CUDA compiled files
-*.deb
+desktop.ini
 
 # Temporary files
-tmp/
-temp/
 *.tmp
+*.temp
+*.log
 *.bak
+
+# Large files
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z

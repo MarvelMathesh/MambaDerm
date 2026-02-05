@@ -297,3 +297,166 @@ class MultiObjectiveLoss(nn.Module):
         
         return total
 
+
+class MultiClassFocalLoss(nn.Module):
+    """
+    Multi-class Focal Loss for handling class imbalance in multi-class problems.
+    
+    FL(p_t) = -α_c * (1 - p_t)^γ * log(p_t)
+    
+    Args:
+        num_classes: Number of classes
+        alpha: Per-class weighting factors (tensor of shape [num_classes])
+        gamma: Focusing parameter (default: 2.0)
+        reduction: Reduction method ('mean', 'sum', 'none')
+    """
+    
+    def __init__(
+        self,
+        num_classes: int = 7,
+        alpha: torch.Tensor = None,
+        gamma: float = 2.0,
+        reduction: str = 'mean',
+        label_smoothing: float = 0.0,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.gamma = gamma
+        self.reduction = reduction
+        self.label_smoothing = label_smoothing
+        
+        if alpha is None:
+            self.register_buffer('alpha', torch.ones(num_classes))
+        else:
+            self.register_buffer('alpha', alpha)
+    
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            inputs: Logits of shape (N, C) where C = num_classes
+            targets: Class indices of shape (N,) with values in [0, C-1]
+            
+        Returns:
+            Focal loss
+        """
+        # Compute softmax probabilities
+        p = F.softmax(inputs, dim=1)
+        
+        # Get class probabilities for targets
+        ce_loss = F.cross_entropy(
+            inputs, targets, 
+            reduction='none',
+            label_smoothing=self.label_smoothing
+        )
+        
+        # Get p_t (probability of correct class)
+        p_t = p.gather(1, targets.unsqueeze(1)).squeeze(1)
+        
+        # Focal weight
+        focal_weight = (1 - p_t) ** self.gamma
+        
+        # Alpha weight per sample
+        alpha_t = self.alpha[targets]
+        
+        # Combine
+        loss = alpha_t * focal_weight * ce_loss
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+
+class LabelSmoothingCrossEntropy(nn.Module):
+    """
+    Cross-entropy loss with label smoothing for better calibration.
+    
+    Smoothing distributes some probability mass from the target class
+    to all other classes, reducing overconfidence.
+    
+    Args:
+        smoothing: Label smoothing factor (default: 0.1)
+        weight: Per-class weights (optional)
+        reduction: Reduction method ('mean', 'sum', 'none')
+    """
+    
+    def __init__(
+        self,
+        smoothing: float = 0.1,
+        weight: torch.Tensor = None,
+        reduction: str = 'mean',
+    ):
+        super().__init__()
+        self.smoothing = smoothing
+        self.reduction = reduction
+        
+        if weight is not None:
+            self.register_buffer('weight', weight)
+        else:
+            self.weight = None
+    
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            inputs: Logits of shape (N, C)
+            targets: Class indices of shape (N,)
+            
+        Returns:
+            Label smoothing cross-entropy loss
+        """
+        return F.cross_entropy(
+            inputs, targets,
+            weight=self.weight,
+            reduction=self.reduction,
+            label_smoothing=self.smoothing,
+        )
+
+
+class MultiClassMultiObjectiveLoss(nn.Module):
+    """
+    Multi-objective loss for multi-class classification.
+    
+    Combines:
+    - Multi-class Focal Loss (handles class imbalance)
+    - Label Smoothing Cross-Entropy (improves calibration)
+    
+    Args:
+        num_classes: Number of classes
+        class_weights: Per-class weights for focal loss
+        focal_weight: Weight for focal loss component
+        smooth_weight: Weight for label smoothing component
+        gamma: Focal loss focusing parameter
+        smoothing: Label smoothing factor
+    """
+    
+    def __init__(
+        self,
+        num_classes: int = 7,
+        class_weights: torch.Tensor = None,
+        focal_weight: float = 0.7,
+        smooth_weight: float = 0.3,
+        gamma: float = 2.0,
+        smoothing: float = 0.1,
+    ):
+        super().__init__()
+        
+        self.focal_weight = focal_weight
+        self.smooth_weight = smooth_weight
+        
+        self.focal = MultiClassFocalLoss(
+            num_classes=num_classes,
+            alpha=class_weights,
+            gamma=gamma,
+        )
+        self.smooth = LabelSmoothingCrossEntropy(
+            smoothing=smoothing,
+            weight=class_weights,
+        )
+    
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        focal_loss = self.focal(inputs, targets)
+        smooth_loss = self.smooth(inputs, targets)
+        
+        return self.focal_weight * focal_loss + self.smooth_weight * smooth_loss

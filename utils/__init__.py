@@ -1,12 +1,22 @@
 """MambaDerm Utils Package."""
 
-from .metrics import compute_pauc, pAUCMetric
+from .metrics import (
+    compute_pauc, 
+    pAUCMetric,
+    compute_balanced_accuracy,
+    compute_macro_f1,
+    compute_per_class_accuracy,
+    MultiClassMetrics,
+)
 from .losses import (
     FocalLoss, 
     AsymmetricLoss, 
     LabelSmoothingBCE,
     AUCMaxLoss,
     MultiObjectiveLoss,
+    MultiClassFocalLoss,
+    LabelSmoothingCrossEntropy,
+    MultiClassMultiObjectiveLoss,
 )
 from .scheduler import get_cosine_schedule_with_warmup
 from .tta import TTAWrapper, TTAInference, get_tta_predictions
@@ -26,15 +36,24 @@ from .export import (
 )
 
 __all__ = [
-    # Metrics
+    # Metrics (binary)
     "compute_pauc",
     "pAUCMetric",
-    # Losses
+    # Metrics (multi-class)
+    "compute_balanced_accuracy",
+    "compute_macro_f1", 
+    "compute_per_class_accuracy",
+    "MultiClassMetrics",
+    # Losses (binary)
     "FocalLoss",
     "AsymmetricLoss",
     "LabelSmoothingBCE",
     "AUCMaxLoss",
     "MultiObjectiveLoss",
+    # Losses (multi-class)
+    "MultiClassFocalLoss",
+    "LabelSmoothingCrossEntropy",
+    "MultiClassMultiObjectiveLoss",
     # Scheduler
     "get_cosine_schedule_with_warmup",
     # TTA
@@ -54,4 +73,3 @@ __all__ = [
     "benchmark_inference",
     "InferencePipeline",
 ]
-

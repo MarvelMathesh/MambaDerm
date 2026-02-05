@@ -380,7 +380,7 @@ def main():
     
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    print(f"MambaDerm - Training")
+    print(f"MambaDerm - World-Class Training")
     print("=" * 60)
     
     checkpoint_dir = Path(args.checkpoint_dir) / f"fold_{args.fold}"
