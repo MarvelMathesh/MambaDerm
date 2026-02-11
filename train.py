@@ -3,10 +3,12 @@ MambaDerm Training Script
 
 Training infrastructure with:
 - Early stopping with patience
-- MixUp/CutMix augmentation
+- MixUp/CutMix augmentation with hard-target routing for AUCMaxLoss
 - Multi-objective loss (Focal + AUC + Label Smoothing)
-- Learning rate warmup + cosine decay
+- Learning rate warmup + cosine decay with layer-wise LR
 - Gradient checkpointing support
+- Weights & Biases logging
+- HDF5-safe multi-worker data loading
 - Proper logging and checkpointing
 """
 
@@ -30,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from config import Config, get_config
 from models import MambaDerm
 from data import ISICDataset, get_train_transforms, get_val_transforms
+from data.dataset import hdf5_worker_init_fn
 from data.sampler import BalancedSampler
 from data.augmentations import MixUpCutMix, get_mixup_cutmix
 from utils import compute_pauc, pAUCMetric, get_cosine_schedule_with_warmup
@@ -107,24 +110,26 @@ def get_args():
     # Model architecture
     parser.add_argument('--img_size', type=int, default=224)
     parser.add_argument('--embed_dim', type=int, default=96)
-    parser.add_argument('--depths', type=int, nargs='+', default=[2, 2, 4])
+    parser.add_argument('--depths', type=int, nargs='+', default=[2, 2, 6])
     parser.add_argument('--d_state', type=int, default=16)
-    parser.add_argument('--drop_path_rate', type=float, default=0.1)
+    parser.add_argument('--drop_path_rate', type=float, default=0.2)
     parser.add_argument('--use_multi_scale', action='store_true', default=True)
     
     # Training
-    parser.add_argument('--epochs', type=int, default=30)
+    parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=5e-5)
-    parser.add_argument('--weight_decay', type=float, default=0.01)
-    parser.add_argument('--warmup_ratio', type=float, default=0.1)
+    parser.add_argument('--weight_decay', type=float, default=0.05)
+    parser.add_argument('--warmup_ratio', type=float, default=0.05)
     parser.add_argument('--min_lr', type=float, default=1e-6)
     parser.add_argument('--grad_clip', type=float, default=1.0)
     parser.add_argument('--accumulation_steps', type=int, default=2)
+    parser.add_argument('--lr_decay', type=float, default=0.8,
+                       help='Layer-wise learning rate decay factor')
     
     # Early stopping
     parser.add_argument('--early_stopping', action='store_true', default=True)
-    parser.add_argument('--patience', type=int, default=5)
+    parser.add_argument('--patience', type=int, default=10)
     
     # Augmentation
     parser.add_argument('--use_mixup', action='store_true', default=True)
@@ -150,6 +155,9 @@ def get_args():
     parser.add_argument('--gradient_checkpointing', action='store_true', default=False)
     parser.add_argument('--quick_test', action='store_true')
     parser.add_argument('--log_interval', type=int, default=100)
+    parser.add_argument('--use_wandb', action='store_true', default=False,
+                       help='Enable Weights & Biases logging')
+    parser.add_argument('--wandb_project', type=str, default='mambaderm')
     
     return parser.parse_args()
 
@@ -196,6 +204,7 @@ def create_dataloaders(args) -> Tuple[DataLoader, DataLoader]:
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
+        worker_init_fn=hdf5_worker_init_fn,
     )
     
     val_loader = DataLoader(
@@ -204,6 +213,7 @@ def create_dataloaders(args) -> Tuple[DataLoader, DataLoader]:
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
+        worker_init_fn=hdf5_worker_init_fn,
     )
     
     return train_loader, val_loader
@@ -217,7 +227,7 @@ def create_model(args) -> nn.Module:
         depths=args.depths,
         d_state=args.d_state,
         num_classes=1,
-        dropout=0.1,
+        dropout=0.15,
         drop_path_rate=args.drop_path_rate,
         use_tabular=True,
         use_multi_scale=args.use_multi_scale,
@@ -242,7 +252,7 @@ def train_epoch(
     epoch: int,
     mixup_fn: Optional[MixUpCutMix] = None,
 ) -> Dict[str, float]:
-    """Train for one epoch with MixUp/CutMix."""
+    """Train for one epoch with MixUp/CutMix and hard-target routing."""
     model.train()
     
     total_loss = 0.0
@@ -256,14 +266,21 @@ def train_epoch(
         tabular = tabular.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         
-        # Apply MixUp/CutMix
+        # Preserve hard targets for AUCMaxLoss before MixUp
+        hard_targets = targets.clone()
+        
+        # Apply MixUp/CutMix (produces soft targets)
         if mixup_fn is not None and model.training:
             images, targets, tabular, _ = mixup_fn(images, targets, tabular)
         
         # Mixed precision forward
         with autocast('cuda', enabled=args.use_amp):
             outputs = model(images, tabular)
-            loss = criterion(outputs.squeeze(), targets)
+            # Pass both soft and hard targets to loss
+            if hasattr(criterion, 'auc'):
+                loss = criterion(outputs.squeeze(), targets, hard_targets=hard_targets)
+            else:
+                loss = criterion(outputs.squeeze(), targets)
             loss = loss / args.accumulation_steps
         
         # Backward
@@ -374,13 +391,62 @@ def save_checkpoint(
         print(f"  ✓ Saved best model with pAUC={metrics['val_pauc']:.4f}")
 
 
+def get_layer_wise_lr_groups(model, base_lr: float, decay: float = 0.8):
+    """
+    Create parameter groups with layer-wise learning rate decay.
+    
+    Deeper (later) stages get higher LR; earlier stages get decayed LR.
+    Tabular encoder and classifier heads use full base_lr.
+    
+    Args:
+        model: MambaDerm model
+        base_lr: Base learning rate for deepest layers
+        decay: Multiplicative decay factor per stage
+        
+    Returns:
+        List of parameter groups for optimizer
+    """
+    groups = []
+    seen_params = set()
+    
+    # Backbone stages: deeper stages get higher LR
+    num_stages = len(model.backbone.stages)
+    for i, stage in enumerate(reversed(model.backbone.stages)):
+        lr = base_lr * (decay ** i)
+        params = [p for p in stage.parameters() if p.requires_grad]
+        seen_params.update(id(p) for p in params)
+        if params:
+            groups.append({'params': params, 'lr': lr, 'name': f'stage_{num_stages - 1 - i}'})
+    
+    # Patch embed: lowest LR
+    patch_params = [p for p in model.backbone.patch_embed.parameters() if p.requires_grad]
+    seen_params.update(id(p) for p in patch_params)
+    if patch_params:
+        groups.append({'params': patch_params, 'lr': base_lr * (decay ** num_stages), 'name': 'patch_embed'})
+    
+    # Position embeddings and backbone norm
+    backbone_other = [p for n, p in model.backbone.named_parameters() 
+                      if p.requires_grad and id(p) not in seen_params]
+    seen_params.update(id(p) for p in backbone_other)
+    if backbone_other:
+        groups.append({'params': backbone_other, 'lr': base_lr * decay, 'name': 'backbone_other'})
+    
+    # All non-backbone params (tabular encoder, fusion, classifier) at base_lr
+    other_params = [p for p in model.parameters() 
+                    if p.requires_grad and id(p) not in seen_params]
+    if other_params:
+        groups.append({'params': other_params, 'lr': base_lr, 'name': 'head'})
+    
+    return groups
+
+
 def main():
     args = get_args()
     set_seed(args.seed)
     
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    print(f"MambaDerm - World-Class Training")
+    print(f"MambaDerm - Research-Grade Training")
     print("=" * 60)
     
     checkpoint_dir = Path(args.checkpoint_dir) / f"fold_{args.fold}"
@@ -408,12 +474,15 @@ def main():
         criterion = FocalLoss(alpha=0.75, gamma=2.0)
         print("Using FocalLoss")
     
-    # Optimizer
+    # Optimizer with layer-wise learning rate decay
+    param_groups = get_layer_wise_lr_groups(model, base_lr=args.lr, decay=args.lr_decay)
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        param_groups,
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
+    for g in param_groups:
+        print(f"  LR group '{g.get('name', '?')}': lr={g['lr']:.2e}, params={len(g['params'])}")
     
     # Scheduler
     num_training_steps = len(train_loader) * args.epochs // args.accumulation_steps
@@ -441,6 +510,23 @@ def main():
     
     # Early stopping
     early_stopper = EarlyStopping(patience=args.patience, mode='max')
+    
+    # Weights & Biases logging
+    wandb_run = None
+    if args.use_wandb:
+        try:
+            import wandb
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                config=vars(args),
+                name=f"fold{args.fold}_seed{args.seed}",
+                tags=[f"fold{args.fold}", f"embed{args.embed_dim}", 
+                      f"depths{'_'.join(map(str, args.depths))}"],
+            )
+            print(f"W&B run: {wandb_run.url}")
+        except ImportError:
+            print("Warning: wandb not installed, skipping W&B logging")
+            args.use_wandb = False
     
     # Training loop
     print("\nStarting training...")
@@ -486,6 +572,18 @@ def main():
         
         print(f"  Best pAUC: {best_pauc:.4f} (Epoch {best_epoch})")
         
+        # W&B logging
+        if args.use_wandb and wandb_run is not None:
+            import wandb
+            wandb.log({
+                'epoch': epoch + 1,
+                'train/loss': metrics['train_loss'],
+                'train/lr': metrics['lr'],
+                'val/loss': metrics['val_loss'],
+                'val/pAUC': metrics['val_pauc'],
+                'val/best_pAUC': best_pauc,
+            })
+        
         # Early stopping
         if args.early_stopping and early_stopper(metrics['val_pauc']):
             print(f"\n⚠ Early stopping triggered at epoch {epoch+1}")
@@ -497,6 +595,14 @@ def main():
     print(f"Best pAUC: {best_pauc:.4f} at epoch {best_epoch}")
     print(f"Checkpoints saved to: {checkpoint_dir}")
     print('='*60)
+    
+    # Finish W&B
+    if args.use_wandb and wandb_run is not None:
+        import wandb
+        wandb.log({'best_pAUC': best_pauc, 'best_epoch': best_epoch})
+        wandb.finish()
+    
+    return best_pauc
 
 
 if __name__ == "__main__":

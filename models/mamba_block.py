@@ -24,6 +24,32 @@ except ImportError:
     print("Warning: mamba-ssm not available, using pure PyTorch implementation (slower)")
 
 
+class DropPath(nn.Module):
+    """
+    Drop paths (Stochastic Depth) per sample for regularization.
+    
+    Reference: "Deep Networks with Stochastic Depth" (https://arxiv.org/abs/1603.09382)
+    """
+    
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # (B, 1, 1, ...)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()  # Binarize
+        output = x.div(keep_prob) * random_tensor
+        return output
+    
+    def extra_repr(self) -> str:
+        return f'drop_prob={self.drop_prob}'
+
+
 class SelectiveSSM(nn.Module):
     """
     Selective State Space Model (S6) - Pure PyTorch implementation.
@@ -184,7 +210,8 @@ class VisionMambaBlock(nn.Module):
     Vision Mamba block with bidirectional scanning.
     
     Combines forward and backward SSM passes for images,
-    following the VMamba paper approach.
+    following the VMamba paper approach. Uses gated fusion
+    for adaptive forward/backward balance.
     """
     
     def __init__(
@@ -194,6 +221,7 @@ class VisionMambaBlock(nn.Module):
         d_conv: int = 4,
         expand: int = 2,
         dropout: float = 0.0,
+        drop_path: float = 0.0,
         bidirectional: bool = True,
     ):
         super().__init__()
@@ -239,9 +267,16 @@ class VisionMambaBlock(nn.Module):
                     dropout=dropout,
                 )
             
-            # Fusion for bidirectional
-            self.fusion = nn.Linear(d_model * 2, d_model)
+            # Gated fusion for bidirectional outputs
+            # Adaptive control over forward vs backward contribution per-token
+            self.gate = nn.Sequential(
+                nn.Linear(d_model * 2, d_model),
+                nn.Sigmoid(),
+            )
+            self.out_proj = nn.Linear(d_model * 2, d_model)
         
+        # Stochastic depth
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.dropout = nn.Dropout(dropout)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -264,13 +299,15 @@ class VisionMambaBlock(nn.Module):
             y_backward = self.ssm_backward(x_backward)
             y_backward = torch.flip(y_backward, dims=[1])  # Flip back
             
-            # Fuse forward and backward
-            y = self.fusion(torch.cat([y_forward, y_backward], dim=-1))
+            # Gated fusion of forward and backward
+            combined = torch.cat([y_forward, y_backward], dim=-1)
+            gate = self.gate(combined)
+            y = gate * y_forward + (1 - gate) * y_backward
         else:
             y = y_forward
         
-        # Residual connection
-        y = self.dropout(y) + residual
+        # Residual connection with stochastic depth
+        y = self.drop_path(self.dropout(y)) + residual
         
         return y
 
@@ -281,6 +318,8 @@ class VMambaLayer(nn.Module):
     
     Similar to Transformer layer structure:
     x -> SSM Block -> MLP -> output
+    
+    Supports stochastic depth (drop path) for regularization.
     """
     
     def __init__(
@@ -291,17 +330,19 @@ class VMambaLayer(nn.Module):
         expand: int = 2,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        drop_path: float = 0.0,
         bidirectional: bool = True,
     ):
         super().__init__()
         
-        # SSM Block
+        # SSM Block (drop_path applied inside VisionMambaBlock)
         self.ssm_block = VisionMambaBlock(
             d_model=d_model,
             d_state=d_state,
             d_conv=d_conv,
             expand=expand,
             dropout=dropout,
+            drop_path=drop_path,
             bidirectional=bidirectional,
         )
         
@@ -315,6 +356,9 @@ class VMambaLayer(nn.Module):
             nn.Linear(mlp_hidden, d_model),
             nn.Dropout(dropout),
         )
+        
+        # Drop path for MLP branch
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -324,10 +368,10 @@ class VMambaLayer(nn.Module):
         Returns:
             Output tensor of shape (B, L, D)
         """
-        # SSM block with residual
+        # SSM block (residual + drop_path handled inside VisionMambaBlock)
         x = self.ssm_block(x)
         
-        # MLP block with residual
-        x = x + self.mlp(self.mlp_norm(x))
+        # MLP block with residual + stochastic depth
+        x = x + self.drop_path(self.mlp(self.mlp_norm(x)))
         
         return x

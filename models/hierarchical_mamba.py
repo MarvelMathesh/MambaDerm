@@ -178,10 +178,10 @@ class HierarchicalMambaStage(nn.Module):
         self.dim = dim
         self.depth = depth
         
-        # Stochastic depth
+        # Stochastic depth - pass per-layer drop path rates
         dpr = [x.item() for x in torch.linspace(0, drop_path, depth)]
         
-        # Mamba layers
+        # Mamba layers with stochastic depth
         self.layers = nn.ModuleList([
             VMambaLayer(
                 d_model=dim,
@@ -190,6 +190,7 @@ class HierarchicalMambaStage(nn.Module):
                 expand=expand,
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
+                drop_path=dpr[i],
                 bidirectional=True,
             )
             for i in range(depth)
@@ -357,60 +358,6 @@ class HierarchicalMambaBackbone(nn.Module):
         """Get final features only."""
         x, _ = self.forward(x)
         return x
-
-
-class GatedBidirectionalFusion(nn.Module):
-    """
-    Improved gated fusion for bidirectional SSM outputs.
-    
-    Uses learnable gates with temperature scaling for
-    adaptive forward/backward balance.
-    """
-    
-    def __init__(self, dim: int, temperature: float = 1.0):
-        super().__init__()
-        
-        # Learnable gate
-        self.gate_proj = nn.Sequential(
-            nn.Linear(dim * 2, dim),
-            nn.GELU(),
-            nn.Linear(dim, 2),  # Forward and backward weights
-        )
-        
-        # Temperature for softmax sharpness
-        self.temperature = nn.Parameter(torch.tensor(temperature))
-        
-        # Output projection
-        self.out_proj = nn.Linear(dim * 2, dim)
-        self.norm = nn.LayerNorm(dim)
-    
-    def forward(
-        self, forward_feat: torch.Tensor, backward_feat: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Args:
-            forward_feat: (B, L, D) forward SSM output
-            backward_feat: (B, L, D) backward SSM output
-            
-        Returns:
-            fused: (B, L, D) gated fusion
-        """
-        # Compute gates
-        combined = torch.cat([forward_feat, backward_feat], dim=-1)
-        gates = self.gate_proj(combined)  # B, L, 2
-        gates = F.softmax(gates / self.temperature, dim=-1)
-        
-        # Weighted combination
-        fused = (
-            gates[..., 0:1] * forward_feat + 
-            gates[..., 1:2] * backward_feat
-        )
-        
-        # Additional projection for richer fusion
-        fused = fused + self.out_proj(combined)
-        fused = self.norm(fused)
-        
-        return fused
 
 
 if __name__ == "__main__":

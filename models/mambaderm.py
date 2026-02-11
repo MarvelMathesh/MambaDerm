@@ -4,10 +4,10 @@ MambaDerm: Hybrid CNN-Mamba Architecture
 A novel architecture featuring:
 - Hierarchical 3-stage Mamba backbone with multi-scale patches
 - Multi-scale patch embedding (4×4, 8×8, 16×16)
-- Enhanced gated bidirectional fusion
+- Gated bidirectional SSM fusion
 - Multi-head cross-modal attention with feature pyramid
-- Stochastic depth regularization
-
+- Stochastic depth regularization (properly wired)
+- Dimension-safe local-global gating with projection
 """
 
 import math
@@ -22,7 +22,6 @@ from einops import rearrange
 from .hierarchical_mamba import (
     HierarchicalMambaBackbone,
     MultiScalePatchEmbed,
-    GatedBidirectionalFusion,
 )
 from .tabular_encoder import TabularEncoder
 
@@ -236,7 +235,7 @@ class MambaDerm(nn.Module):
         img_size: Input image size (default: 224)
         in_channels: Number of input channels
         embed_dim: Base embedding dimension (default: 96)
-        depths: Layers per stage (default: [2, 2, 4])
+        depths: Layers per stage (default: [2, 2, 6])
         num_numerical_features: Numerical tabular features
         num_categorical_features: Categorical tabular features
         num_classes: Output classes (1 for binary)
@@ -255,8 +254,8 @@ class MambaDerm(nn.Module):
         num_numerical_features: int = 34,
         num_categorical_features: int = 6,
         num_classes: int = 1,
-        dropout: float = 0.1,
-        drop_path_rate: float = 0.1,
+        dropout: float = 0.15,
+        drop_path_rate: float = 0.2,
         use_tabular: bool = True,
         use_multi_scale: bool = True,
         gradient_checkpointing: bool = False,
@@ -265,7 +264,7 @@ class MambaDerm(nn.Module):
         
         # Handle mutable default argument
         if depths is None:
-            depths = [2, 2, 4]
+            depths = [2, 2, 6]
         
         self.use_tabular = use_tabular
         self.num_classes = num_classes
@@ -313,6 +312,15 @@ class MambaDerm(nn.Module):
         
         # Feature pyramid fusion - use stage OUTPUT dims
         self.pyramid_fusion = FeaturePyramidFusion(stage_out_dims, final_dim)
+        
+        # Local feature projection (align second-to-last stage dim to final_dim)
+        if len(depths) > 1 and stage_out_dims[-2] != final_dim:
+            self.local_proj = nn.Sequential(
+                nn.Linear(stage_out_dims[-2], final_dim),
+                nn.LayerNorm(final_dim),
+            )
+        else:
+            self.local_proj = nn.Identity()
         
         # Enhanced multimodal fusion
         self.fusion = EnhancedMultiModalFusion(
@@ -378,10 +386,10 @@ class MambaDerm(nn.Module):
         # Feature pyramid fusion (global feature from all stages)
         pyramid_feat = self.pyramid_fusion(stage_features)
         
-        # Use final features for fusion (all same dimension)
-        # For local-global, use last two stages which have same dimension
+        # Use final features for fusion
+        # Project local features to match final dimension
         if len(stage_features) > 1:
-            local_feat = stage_features[-2]  # Second-to-last stage (same dim as final)
+            local_feat = self.local_proj(stage_features[-2])  # Now (B, L, final_dim)
         else:
             local_feat = final_feat
         
@@ -443,7 +451,7 @@ class MambaDermLite(nn.Module):
             num_numerical_features=num_numerical_features,
             num_categorical_features=num_categorical_features,
             num_classes=num_classes,
-            dropout=0.1,
+            dropout=0.15,
             use_multi_scale=False,
         )
     
@@ -461,7 +469,7 @@ if __name__ == "__main__":
     model = MambaDerm(
         img_size=224,
         embed_dim=96,
-        depths=[2, 2, 4],
+        depths=[2, 2, 6],
         num_classes=1,
     )
     

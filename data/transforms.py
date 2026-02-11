@@ -2,7 +2,7 @@
 Image Transforms
 
 Augmentation pipelines for training and validation using albumentations.
-Based on ISIC 2024 winner strategies.
+Based on ISIC 2024 winner strategies with domain-specific refinements.
 """
 
 import albumentations as A
@@ -14,8 +14,9 @@ def get_train_transforms(img_size: int = 224):
     Get training augmentation pipeline.
     
     Heavy augmentation based on ISIC 2024 winner strategies:
-    - Geometric: Flip, Rotate90, ShiftScaleRotate, ElasticTransform
-    - Color: RandomBrightnessContrast, HueSaturationValue, CLAHE
+    - Geometric: Flip, Rotate90, ShiftScaleRotate
+    - Color: RandomBrightnessContrast, HueSaturationValue, CLAHE, RGBShift
+    - Resolution: Downscale (simulates lower-res clinical captures)
     - Blur/Noise: MotionBlur, MedianBlur, GaussNoise
     - Regularization: CoarseDropout
     """
@@ -47,9 +48,22 @@ def get_train_transforms(img_size: int = 224):
             val_shift_limit=15,
             p=0.5,
         ),
+        A.RGBShift(
+            r_shift_limit=10,
+            g_shift_limit=10,
+            b_shift_limit=10,
+            p=0.3,
+        ),
         
         # CLAHE for local contrast
         A.CLAHE(clip_limit=4.0, p=0.5),
+        
+        # Simulate lower-resolution captures
+        A.Downscale(
+            scale_min=0.5,
+            scale_max=0.9,
+            p=0.2,
+        ),
         
         # Blur and noise (one of)
         A.OneOf([
@@ -59,19 +73,18 @@ def get_train_transforms(img_size: int = 224):
             A.GaussNoise(var_limit=(5.0, 30.0), p=1.0),
         ], p=0.5),
         
-        # Distortion (one of)
+        # Distortion (one of) — no ElasticTransform (changes diagnostic morphology)
         A.OneOf([
             A.OpticalDistortion(distort_limit=0.3, p=1.0),
             A.GridDistortion(num_steps=5, distort_limit=0.3, p=1.0),
-            A.ElasticTransform(alpha=1, sigma=50, p=1.0),
         ], p=0.3),
         
         # Resize
         A.Resize(img_size, img_size),
         
-        # Coarse dropout (cutout)
+        # Coarse dropout (cutout) — max 4 holes to avoid destroying lesion
         A.CoarseDropout(
-            max_holes=8,
+            max_holes=4,
             max_height=int(img_size * 0.1),
             max_width=int(img_size * 0.1),
             min_holes=1,

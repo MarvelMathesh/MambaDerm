@@ -66,10 +66,10 @@ RISK_LEVELS = {
 
 # Clinical recommendations
 CLINICAL_ACTIONS = {
-    'IMMEDIATE': "⚠️ CRITICAL: Suspected melanoma or aggressive carcinoma. IMMEDIATE biopsy and oncology referral required.",
-    'URGENT': "⚠️ URGENT: High malignancy probability. Dermatologist evaluation within 24-48 hours.",
-    'SOON': "⚠️ ATTENTION: Elevated risk or pre-malignant. Dermatologist evaluation within 1-2 weeks.",
-    'ROUTINE': "✓ Low concern: Likely benign. Monitor changes. Annual skin examination recommended.",
+    'IMMEDIATE': "⚠️ HIGH SCORE: Model output suggests elevated risk. Consider dermatology consultation for clinical correlation.",
+    'URGENT': "⚠️ ELEVATED: Model output above typical threshold. Professional evaluation recommended.",
+    'SOON': "⚠️ MODERATE: Slightly elevated model score. Routine dermatology follow-up suggested.",
+    'ROUTINE': "✓ LOW SCORE: Model output within normal range. Standard monitoring per clinical guidelines.",
 }
 
 
@@ -147,13 +147,13 @@ class UnifiedClinicalPredictor:
         model = MambaDerm(
             img_size=self.img_size,
             embed_dim=96,
-            depths=[2, 2, 4],
+            depths=[2, 2, 6],
             d_state=16,
             num_numerical_features=34,
             num_categorical_features=6,
             num_classes=1,  # Binary
-            dropout=0.1,
-            drop_path_rate=0.1,
+            dropout=0.15,
+            drop_path_rate=0.2,
             use_tabular=True,
             use_multi_scale=True,
         )
@@ -181,13 +181,13 @@ class UnifiedClinicalPredictor:
         model = MambaDerm(
             img_size=self.img_size,
             embed_dim=96,
-            depths=[2, 2, 4],
+            depths=[2, 2, 6],
             d_state=16,
             num_numerical_features=19,
             num_categorical_features=0,
             num_classes=7,  # 7-class
-            dropout=0.1,
-            drop_path_rate=0.1,
+            dropout=0.15,
+            drop_path_rate=0.2,
             use_tabular=True,
             use_multi_scale=True,
         )
@@ -210,12 +210,12 @@ class UnifiedClinicalPredictor:
         return transformed['image']
     
     def _get_isic_tabular(self) -> torch.Tensor:
-        """Default tabular for ISIC model."""
-        return torch.zeros(1, 40)
+        """Default tabular for ISIC model (NaN triggers missingness embeddings)."""
+        return torch.full((1, 40), float('nan'))
     
     def _get_ham_tabular(self) -> torch.Tensor:
-        """Default tabular for HAM model."""
-        return torch.zeros(1, 19)
+        """Default tabular for HAM model (NaN triggers missingness embeddings)."""
+        return torch.full((1, 19), float('nan'))
     
     @torch.no_grad()
     def _predict_isic(self, image_np: np.ndarray) -> float:

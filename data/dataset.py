@@ -341,6 +341,7 @@ class ISICTestDataset(Dataset):
     ISIC 2024 Test Dataset (without labels).
     
     For inference on test set.
+    Requires norm_stats from training set to prevent distribution mismatch.
     """
     
     def __init__(
@@ -349,17 +350,26 @@ class ISICTestDataset(Dataset):
         hdf5_name: str = 'test-image.hdf5',
         csv_name: str = 'test-metadata.csv',
         transform = None,
+        norm_stats: Optional[Dict] = None,
     ):
         super().__init__()
         
         self.data_dir = Path(data_dir)
         self.transform = transform
         
+        if norm_stats is None:
+            raise ValueError(
+                "norm_stats is required for ISICTestDataset to prevent "
+                "train/test distribution mismatch. Pass the output of "
+                "train_dataset.get_norm_stats() here."
+            )
+        self.norm_stats = norm_stats
+        
         # Load metadata
         self.df = pd.read_csv(self.data_dir / csv_name, low_memory=False)
         self.isic_ids = self.df['isic_id'].values
         
-        # Prepare tabular features (same as training)
+        # Prepare tabular features (using training statistics)
         self._prepare_tabular_features()
         
         # HDF5 file
@@ -369,14 +379,26 @@ class ISICTestDataset(Dataset):
         print(f"Loaded test dataset: {len(self.df)} samples")
     
     def _prepare_tabular_features(self):
-        """Prepare tabular features for test set."""
+        """Prepare tabular features for test set using training statistics."""
         # Handle missing features
         for col in NUMERICAL_FEATURES:
             if col not in self.df.columns:
                 self.df[col] = 0.0
         
-        num_df = self.df[NUMERICAL_FEATURES].fillna(0).astype(np.float32)
-        self.numerical_features = num_df.values
+        num_df = self.df[NUMERICAL_FEATURES].copy()
+        
+        # Use training medians for imputation (not zeros!)
+        medians = self.norm_stats.get('median', {})
+        for col in NUMERICAL_FEATURES:
+            median_val = medians.get(col, 0.0)
+            if pd.isna(median_val):
+                median_val = 0.0
+            num_df[col] = num_df[col].fillna(median_val)
+        
+        # Apply training z-score normalization
+        self.numerical_features = (
+            num_df.values.astype(np.float32) - self.norm_stats['mean']
+        ) / self.norm_stats['std']
         
         # Categorical features
         cat_features = []
@@ -424,3 +446,22 @@ class ISICTestDataset(Dataset):
     def __del__(self):
         if self._hdf5_file is not None:
             self._hdf5_file.close()
+
+
+def hdf5_worker_init_fn(worker_id: int):
+    """
+    Worker init function for DataLoader with HDF5 datasets.
+    
+    HDF5 file handles are not fork-safe. Each DataLoader worker
+    must re-open its own file handle to prevent corruption.
+    
+    Usage:
+        DataLoader(dataset, ..., worker_init_fn=hdf5_worker_init_fn)
+    """
+    import torch.utils.data as data
+    worker_info = data.get_worker_info()
+    if worker_info is not None:
+        dataset = worker_info.dataset
+        # Reset HDF5 handle so it will be re-opened in this worker process
+        if hasattr(dataset, '_hdf5_file'):
+            dataset._hdf5_file = None

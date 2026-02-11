@@ -217,29 +217,49 @@ class AUCMaxLoss(nn.Module):
     
     This is more aligned with the pAUC evaluation metric.
     
+    IMPORTANT: This loss requires hard (binary) targets. When using MixUp/CutMix,
+    pass the original hard targets via the hard_targets parameter, NOT the
+    interpolated soft targets (which will never == 1).
+    
     Args:
-        margin: Margin for pairwise ranking (default: 1.0)
-        gamma: Soft margin temperature (default: 2.0)
+        margin: Margin for pairwise ranking (default: 0.5)
+        gamma: Soft margin temperature (default: 1.0)
     """
     
-    def __init__(self, margin: float = 1.0, gamma: float = 2.0):
+    def __init__(self, margin: float = 0.5, gamma: float = 1.0):
         super().__init__()
         self.margin = margin
         self.gamma = gamma
     
-    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, 
+        inputs: torch.Tensor, 
+        targets: torch.Tensor,
+        hard_targets: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            inputs: Logits of shape (N,) or (N, 1)
+            targets: Soft or hard targets (used only if hard_targets is None)
+            hard_targets: Original hard binary targets (preferred when using MixUp)
+        """
         inputs = inputs.view(-1)
-        targets = targets.view(-1)
         
-        # Separate positive and negative samples
-        pos_mask = targets == 1
-        neg_mask = targets == 0
+        # Use hard targets for pos/neg separation (critical for MixUp compatibility)
+        if hard_targets is not None:
+            separation_targets = hard_targets.view(-1)
+        else:
+            separation_targets = targets.view(-1)
+        
+        # Separate positive and negative samples using hard labels
+        pos_mask = separation_targets > 0.5
+        neg_mask = separation_targets < 0.5
         
         pos_scores = inputs[pos_mask]
         neg_scores = inputs[neg_mask]
         
         if len(pos_scores) == 0 or len(neg_scores) == 0:
-            return torch.tensor(0.0, device=inputs.device)
+            return torch.tensor(0.0, device=inputs.device, requires_grad=True)
         
         # Compute pairwise differences: pos - neg should be positive
         # Shape: (n_pos, n_neg)
@@ -258,6 +278,9 @@ class MultiObjectiveLoss(nn.Module):
     Combines Focal Loss + AUC Loss + Label Smoothing for
     comprehensive training signal.
     
+    MixUp-aware: Routes hard targets to AUCMaxLoss and soft
+    targets to Focal and Label Smoothing losses.
+    
     Args:
         focal_weight: Weight for focal loss (default: 0.5)
         auc_weight: Weight for AUC loss (default: 0.3)
@@ -271,8 +294,9 @@ class MultiObjectiveLoss(nn.Module):
         smooth_weight: float = 0.2,
         focal_alpha: float = 0.75,
         focal_gamma: float = 2.0,
-        smoothing: float = 0.1,
-        auc_margin: float = 1.0,
+        smoothing: float = 0.05,
+        auc_margin: float = 0.5,
+        auc_gamma: float = 1.0,
     ):
         super().__init__()
         
@@ -281,12 +305,23 @@ class MultiObjectiveLoss(nn.Module):
         self.smooth_weight = smooth_weight
         
         self.focal = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
-        self.auc = AUCMaxLoss(margin=auc_margin)
+        self.auc = AUCMaxLoss(margin=auc_margin, gamma=auc_gamma)
         self.smooth = LabelSmoothingBCE(smoothing=smoothing)
     
-    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, 
+        inputs: torch.Tensor, 
+        targets: torch.Tensor,
+        hard_targets: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            inputs: Model logits
+            targets: Soft targets (may be MixUp-interpolated)
+            hard_targets: Original hard binary targets (for AUCMaxLoss)
+        """
         focal_loss = self.focal(inputs, targets)
-        auc_loss = self.auc(inputs, targets)
+        auc_loss = self.auc(inputs, targets, hard_targets=hard_targets)
         smooth_loss = self.smooth(inputs, targets)
         
         total = (

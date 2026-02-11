@@ -1,12 +1,15 @@
 """
-HAM10000 Training Script
+HAM10000 Training Script (Golden Pipeline)
 
-World-class training for 7-class skin cancer classification with:
+7-class skin cancer classification with:
 - Multi-class Focal Loss with class weighting
 - CutMix augmentation (clinically appropriate)
 - Progressive oversampling for minority classes
+- Stochastic depth (drop_path) + gated bidirectional fusion
+- Layer-wise learning rate decay
 - Early stopping with patience
 - Balanced accuracy & Macro F1 evaluation
+- Optional W&B logging
 """
 
 import argparse
@@ -156,19 +159,21 @@ def get_args():
     # Model
     parser.add_argument('--img_size', type=int, default=224)
     parser.add_argument('--embed_dim', type=int, default=96)
-    parser.add_argument('--depths', type=int, nargs='+', default=[2, 2, 4])
+    parser.add_argument('--depths', type=int, nargs='+', default=[2, 2, 6])
     parser.add_argument('--d_state', type=int, default=16)
-    parser.add_argument('--drop_path_rate', type=float, default=0.1)
+    parser.add_argument('--dropout', type=float, default=0.15)
+    parser.add_argument('--drop_path_rate', type=float, default=0.2)
     
     # Training
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--weight_decay', type=float, default=0.01)
-    parser.add_argument('--warmup_ratio', type=float, default=0.1)
+    parser.add_argument('--weight_decay', type=float, default=0.05)
+    parser.add_argument('--warmup_ratio', type=float, default=0.05)
     parser.add_argument('--min_lr', type=float, default=1e-6)
     parser.add_argument('--grad_clip', type=float, default=1.0)
     parser.add_argument('--accumulation_steps', type=int, default=1)
+    parser.add_argument('--lr_decay', type=float, default=0.8)
     
     # Augmentation
     parser.add_argument('--use_cutmix', action='store_true', default=True)
@@ -180,7 +185,7 @@ def get_args():
     
     # Early stopping
     parser.add_argument('--early_stopping', action='store_true', default=True)
-    parser.add_argument('--patience', type=int, default=7)
+    parser.add_argument('--patience', type=int, default=10)
     
     # Checkpointing
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints_ham10000')
@@ -192,6 +197,10 @@ def get_args():
     parser.add_argument('--use_amp', action='store_true', default=True)
     parser.add_argument('--quick_test', action='store_true')
     parser.add_argument('--log_interval', type=int, default=50)
+    
+    # W&B
+    parser.add_argument('--use_wandb', action='store_true', default=False)
+    parser.add_argument('--wandb_project', type=str, default='mambaderm')
     
     return parser.parse_args()
 
@@ -263,7 +272,7 @@ def create_model(args) -> nn.Module:
         num_numerical_features=19,  # All pre-encoded features
         num_categorical_features=0,  # No categorical embeddings
         num_classes=7,  # 7 skin cancer classes
-        dropout=0.1,
+        dropout=args.dropout,
         drop_path_rate=args.drop_path_rate,
         use_tabular=True,
         use_multi_scale=True,
@@ -431,6 +440,47 @@ def save_checkpoint(
         print(f"  ✓ Saved best model with balanced_acc={metrics['val_balanced_acc']:.4f}")
 
 
+def get_layer_wise_lr_groups(model, base_lr: float, decay: float = 0.8):
+    """
+    Create parameter groups with layer-wise learning rate decay.
+    
+    Deeper (later) stages get higher LR; earlier stages get decayed LR.
+    Tabular encoder and classifier heads use full base_lr.
+    """
+    groups = []
+    seen_params = set()
+    
+    # Backbone stages: deeper stages get higher LR
+    num_stages = len(model.backbone.stages)
+    for i, stage in enumerate(reversed(model.backbone.stages)):
+        lr = base_lr * (decay ** i)
+        params = [p for p in stage.parameters() if p.requires_grad]
+        seen_params.update(id(p) for p in params)
+        if params:
+            groups.append({'params': params, 'lr': lr, 'name': f'stage_{num_stages - 1 - i}'})
+    
+    # Patch embed: lowest LR
+    patch_params = [p for p in model.backbone.patch_embed.parameters() if p.requires_grad]
+    seen_params.update(id(p) for p in patch_params)
+    if patch_params:
+        groups.append({'params': patch_params, 'lr': base_lr * (decay ** num_stages), 'name': 'patch_embed'})
+    
+    # Position embeddings and backbone norm
+    backbone_other = [p for n, p in model.backbone.named_parameters()
+                      if p.requires_grad and id(p) not in seen_params]
+    seen_params.update(id(p) for p in backbone_other)
+    if backbone_other:
+        groups.append({'params': backbone_other, 'lr': base_lr * decay, 'name': 'backbone_other'})
+    
+    # All non-backbone params (tabular encoder, fusion, classifier) at base_lr
+    other_params = [p for p in model.parameters()
+                    if p.requires_grad and id(p) not in seen_params]
+    if other_params:
+        groups.append({'params': other_params, 'lr': base_lr, 'name': 'head'})
+    
+    return groups
+
+
 def main():
     args = get_args()
     set_seed(args.seed)
@@ -438,7 +488,7 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     print("=" * 60)
-    print("MambaDerm HAM10000 Training")
+    print("MambaDerm HAM10000 Training (Golden Pipeline)")
     print("7-Class Skin Cancer Classification")
     print("=" * 60)
     
@@ -465,9 +515,10 @@ def main():
     )
     print(f"Using MultiClassFocalLoss (γ={args.focal_gamma}, smoothing={args.label_smoothing})")
     
-    # Optimizer
+    # Optimizer with layer-wise LR decay
+    param_groups = get_layer_wise_lr_groups(model, base_lr=args.lr, decay=args.lr_decay)
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        param_groups,
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
@@ -494,6 +545,20 @@ def main():
     
     # Early stopping
     early_stopper = EarlyStopping(patience=args.patience)
+    
+    # W&B
+    if args.use_wandb:
+        try:
+            import wandb
+            wandb.init(
+                project=args.wandb_project,
+                config=vars(args),
+                name=f"ham10000_fold{args.fold}",
+                tags=["ham10000", f"fold{args.fold}"],
+            )
+        except ImportError:
+            print("Warning: wandb not installed, skipping logging")
+            args.use_wandb = False
     
     # Training loop
     print("\nStarting training...")
@@ -537,17 +602,38 @@ def main():
         save_checkpoint(model, optimizer, scheduler, epoch, metrics, checkpoint_dir, is_best)
         print(f"  Best Balanced Acc: {best_balanced_acc:.4f} (Epoch {best_epoch})")
         
+        # W&B log
+        if args.use_wandb:
+            import wandb
+            wandb.log({
+                'epoch': epoch + 1,
+                'train/loss': metrics['train_loss'],
+                'val/loss': metrics['val_loss'],
+                'val/balanced_acc': metrics['val_balanced_acc'],
+                'val/macro_f1': metrics['val_macro_f1'],
+                'val/best_balanced_acc': best_balanced_acc,
+                'lr': metrics['lr'],
+            })
+        
         # Early stopping
         if args.early_stopping and early_stopper(metrics['val_balanced_acc']):
             print(f"\n⚠ Early stopping at epoch {epoch+1}")
             print(f"  No improvement for {args.patience} epochs")
             break
     
+    # W&B finish
+    if args.use_wandb:
+        import wandb
+        wandb.log({'best_balanced_acc': best_balanced_acc, 'best_epoch': best_epoch})
+        wandb.finish()
+    
     print(f"\n{'='*60}")
     print("Training Complete!")
     print(f"Best Balanced Accuracy: {best_balanced_acc:.4f} at epoch {best_epoch}")
     print(f"Checkpoints saved to: {checkpoint_dir}")
     print('='*60)
+    
+    return best_balanced_acc
 
 
 if __name__ == "__main__":
