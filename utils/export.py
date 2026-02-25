@@ -21,7 +21,7 @@ def export_torchscript(
     model: nn.Module,
     save_path: str,
     img_size: int = 224,
-    example_tabular_dim: int = 40,
+    example_tabular_dim: int = 39,
 ) -> str:
     """
     Export model to TorchScript format.
@@ -66,7 +66,7 @@ def export_onnx(
     model: nn.Module,
     save_path: str,
     img_size: int = 224,
-    example_tabular_dim: int = 40,
+    example_tabular_dim: int = 39,
     opset_version: int = 17,
     dynamic_batch: bool = True,
 ) -> str:
@@ -156,7 +156,7 @@ def quantize_dynamic(
 def benchmark_inference(
     model: nn.Module,
     img_size: int = 224,
-    tabular_dim: int = 40,
+    tabular_dim: int = 39,
     batch_sizes: list = [1, 4, 8, 16],
     n_warmup: int = 10,
     n_runs: int = 100,

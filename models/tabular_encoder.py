@@ -106,15 +106,15 @@ class TabularEncoder(nn.Module):
                 self.missing_embed.unsqueeze(0).expand(batch_size, -1),
                 numerical
             )
-            # Concatenate missingness indicator
-            numerical_with_mask = torch.cat([numerical, is_missing], dim=-1)  # (B, num_numerical * 2)
         else:
             numerical = torch.nan_to_num(numerical, nan=0.0)
-            numerical_with_mask = numerical
+            is_missing = None
         
-        # Apply normalization only to the original features
+        # Apply normalization to the (NaN-free) numerical features
         num_normed = self.num_norm(numerical)
-        if self.use_missingness_embedding:
+        
+        # Concatenate missingness indicator if enabled
+        if self.use_missingness_embedding and is_missing is not None:
             num_feat = torch.cat([num_normed, is_missing], dim=-1)
         else:
             num_feat = num_normed

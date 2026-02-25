@@ -169,11 +169,17 @@ class ISICDataset(Dataset):
             print(f"  Positive: {pos_count}, Negative: {len(self.df) - pos_count}")
     
     def _build_categorical_mappings(self):
-        """Build mappings for dynamically varying categorical columns."""
+        """Build instance-level mappings for categorical columns.
+        
+        Uses a copy of the global mappings to avoid mutating shared state
+        across dataset instances (train/val), which would cause data leakage.
+        """
+        import copy
+        self._categorical_mappings = copy.deepcopy(CATEGORICAL_MAPPINGS)
         for col in ['tbp_lv_location', 'attribution']:
             if col in self.df.columns:
                 unique_vals = self.df[col].dropna().unique()
-                CATEGORICAL_MAPPINGS[col] = {v: i+1 for i, v in enumerate(unique_vals)}
+                self._categorical_mappings[col] = {v: i+1 for i, v in enumerate(unique_vals)}
     
     def _create_cv_split(self, fold: int, n_folds: int):
         """Create stratified group k-fold split by patient_id."""
@@ -238,7 +244,7 @@ class ISICDataset(Dataset):
         cat_features = []
         for col in CATEGORICAL_FEATURES:
             if col in self.df.columns:
-                mapping = CATEGORICAL_MAPPINGS.get(col, {})
+                mapping = self._categorical_mappings.get(col, {})
                 cat_values = self.df[col].map(mapping).fillna(0).astype(np.int64)
                 cat_features.append(cat_values.values)
             else:

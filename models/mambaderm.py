@@ -184,22 +184,14 @@ class EnhancedMultiModalFusion(nn.Module):
     ) -> torch.Tensor:
         """Fuse local, global, and tabular features."""
         
-        # Handle size mismatch by interpolation
+        # Handle size mismatch by adaptive pooling
         if local_feat.shape[1] != global_feat.shape[1]:
-            B, L_local, D = local_feat.shape
             L_global = global_feat.shape[1]
-            
-            # Pool local to match global
-            ratio_squared = L_local / L_global
-            ratio = int(math.sqrt(ratio_squared))
-            # Ensure ratio is valid
-            ratio = max(1, ratio)
-            
-            if ratio > 1:
-                H = W = int(math.sqrt(L_local))
-                local_feat = rearrange(local_feat, 'b (h w) d -> b d h w', h=H, w=W)
-                local_feat = F.avg_pool2d(local_feat, kernel_size=ratio)
-                local_feat = rearrange(local_feat, 'b d h w -> b (h w) d')
+            # Use adaptive average pooling over the sequence dimension
+            # Rearrange to (B, D, L) for pooling, then back
+            local_feat = local_feat.permute(0, 2, 1)  # B, D, L_local
+            local_feat = F.adaptive_avg_pool1d(local_feat, L_global)  # B, D, L_global
+            local_feat = local_feat.permute(0, 2, 1)  # B, L_global, D
         
         # Gated fusion of local and global
         combined = torch.cat([local_feat, global_feat], dim=-1)
@@ -251,7 +243,7 @@ class MambaDerm(nn.Module):
         embed_dim: int = 96,
         depths: Optional[List[int]] = None,
         d_state: int = 16,
-        num_numerical_features: int = 34,
+        num_numerical_features: int = 33,
         num_categorical_features: int = 6,
         num_classes: int = 1,
         dropout: float = 0.15,
@@ -351,6 +343,10 @@ class MambaDerm(nn.Module):
         self.apply(self._init_weights)
     
     def _init_weights(self, m):
+        # Skip SSM-specific modules — they use specialized initialization
+        # (A_log, D, dt_proj) from the Mamba paper
+        if hasattr(m, 'A_log') or hasattr(m, 'dt_proj'):
+            return
         if isinstance(m, nn.Linear):
             nn.init.trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
@@ -436,7 +432,7 @@ class MambaDermLite(nn.Module):
     def __init__(
         self,
         img_size: int = 224,
-        num_numerical_features: int = 35,
+        num_numerical_features: int = 33,
         num_categorical_features: int = 6,
         num_classes: int = 1,
     ):

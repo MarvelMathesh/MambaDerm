@@ -85,13 +85,15 @@ class HAM10000Dataset(Dataset):
         n_folds: int = 5,
         transform=None,
         quick_test: bool = False,
-        quick_test_samples: int = 500,
+        quick_test_samples: int = 1000,
+        norm_stats: dict = None,
     ):
         super().__init__()
         
         self.data_dir = Path(data_dir)
         self.split = split
         self.transform = transform
+        self.norm_stats = norm_stats
         self.num_classes = 7
         
         # Find image directories
@@ -103,7 +105,7 @@ class HAM10000Dataset(Dataset):
         
         # Handle age
         self.df['age'] = pd.to_numeric(self.df['age'], errors='coerce')
-        self.df['age'] = self.df['age'].fillna(self.df['age'].median())
+        # self.df['age'] = self.df['age'].fillna(self.df['age'].median()) # Age fillna moved to _prepare_tabular_features
         
         # Handle sex
         self.df['sex'] = self.df['sex'].fillna('unknown')
@@ -200,8 +202,35 @@ class HAM10000Dataset(Dataset):
     def _prepare_tabular_features(self):
         """Prepare tabular features: age (normalized) + sex + localization."""
         # Age: normalize to 0-1 range
-        age = self.df['age'].values.astype(np.float32)
-        age_norm = (age - age.min()) / (age.max() - age.min() + 1e-8)
+        # Normalize age using training set statistics to prevent leakage
+        age_series = self.df['age'] # Use the original series for stats calculation
+        
+        if self.norm_stats is not None:
+            age_median = self.norm_stats['age_median']
+            age_min = self.norm_stats['age_min']
+            age_max = self.norm_stats['age_max']
+        else:
+            # Compute stats from current dataset (should be training set)
+            age_median = age_series.median()
+            age_min = age_series.min()
+            age_max = age_series.max()
+        
+        # Fill NaNs with the determined median
+        age_filled = age_series.fillna(age_median)
+        
+        # Normalize age
+        age_range = age_max - age_min
+        if age_range > 0:
+            age_norm = (age_filled - age_min) / age_range
+        else:
+            age_norm = pd.Series(0.0, index=self.df.index) # All ages are the same, normalize to 0
+        
+        self.df['age_norm'] = age_norm
+        
+        # Store for get_norm_stats
+        self._age_median = float(age_median)
+        self._age_min = float(age_min)
+        self._age_max = float(age_max)
         
         # Sex: one-hot encode (3 values: male, female, unknown)
         sex = self.df['sex'].map(SEX_MAPPING).fillna(2).values.astype(np.int64)
@@ -214,8 +243,9 @@ class HAM10000Dataset(Dataset):
         loc_onehot = np.eye(len(LOCALIZATION_MAPPING))[loc].astype(np.float32)
         
         # Concatenate: age (1) + sex (3) + localization (15) = 19 features
+        age_arr = np.array(self.df['age_norm'].values, dtype=np.float32)
         self.tabular_features = np.concatenate([
-            age_norm.reshape(-1, 1),
+            age_arr.reshape(-1, 1),
             sex_onehot,
             loc_onehot,
         ], axis=1).astype(np.float32)
@@ -225,6 +255,18 @@ class HAM10000Dataset(Dataset):
         # Store labels
         self.labels = self.df['label'].values.astype(np.int64)
         self.image_ids = self.df['image_id'].values
+    
+    def get_norm_stats(self) -> dict:
+        """Return normalization statistics for cross-split consistency.
+        
+        Pass the result of this method to the `norm_stats` parameter of
+        validation/test dataset constructors to prevent data leakage.
+        """
+        return {
+            'age_median': self._age_median,
+            'age_min': self._age_min,
+            'age_max': self._age_max,
+        }
     
     def _compute_class_weights(self):
         """Compute inverse frequency class weights for balanced training."""

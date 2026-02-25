@@ -72,4 +72,6 @@ __all__ = [
     "quantize_dynamic",
     "benchmark_inference",
     "InferencePipeline",
+    # LR Groups
+    "get_layer_wise_lr_groups",
 ]

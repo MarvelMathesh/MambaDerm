@@ -8,6 +8,7 @@ and "Vision Mamba: Efficient Visual Representation Learning with Bidirectional S
 
 import math
 from typing import Optional, Tuple
+from functools import lru_cache
 
 import torch
 import torch.nn as nn
@@ -94,11 +95,14 @@ class SelectiveSSM(nn.Module):
         )
         
         # SSM parameters (input-dependent)
+        # dt_rank: controls per-channel selectivity granularity (Mamba paper §3.4)
+        self.dt_rank = max(1, math.ceil(d_model / 16))
+        
         # dt (Δ), B, C projections
-        self.x_proj = nn.Linear(self.d_inner, d_state * 2 + 1, bias=False)  # dt, B, C
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + d_state * 2, bias=False)
         
         # dt (Δ) projection - from dt_rank to d_inner
-        self.dt_proj = nn.Linear(1, self.d_inner, bias=True)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
         
         # A parameter (learned, not input-dependent)
         # Initialize A as -exp(uniform) for stable dynamics
@@ -134,8 +138,10 @@ class SelectiveSSM(nn.Module):
         x = F.silu(x)
         
         # SSM parameters (input-dependent)
-        x_proj = self.x_proj(x)  # (B, L, d_state*2 + 1)
-        dt, B, C = x_proj[:, :, 0:1], x_proj[:, :, 1:self.d_state+1], x_proj[:, :, self.d_state+1:]
+        x_proj = self.x_proj(x)  # (B, L, dt_rank + d_state*2)
+        dt = x_proj[:, :, :self.dt_rank]
+        B = x_proj[:, :, self.dt_rank:self.dt_rank + self.d_state]
+        C = x_proj[:, :, self.dt_rank + self.d_state:]
         
         # dt projection
         dt = self.dt_proj(dt)  # (B, L, d_inner)
@@ -273,7 +279,6 @@ class VisionMambaBlock(nn.Module):
                 nn.Linear(d_model * 2, d_model),
                 nn.Sigmoid(),
             )
-            self.out_proj = nn.Linear(d_model * 2, d_model)
         
         # Stochastic depth
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()

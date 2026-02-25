@@ -34,6 +34,7 @@ from data.augmentations import CutMix
 from utils.losses import MultiClassFocalLoss, MultiClassMultiObjectiveLoss
 from utils.metrics import MultiClassMetrics
 from utils.scheduler import get_cosine_schedule_with_warmup
+from utils.lr_groups import get_layer_wise_lr_groups
 
 
 def set_seed(seed: int):
@@ -228,6 +229,7 @@ def create_dataloaders(args) -> Tuple[DataLoader, DataLoader, torch.Tensor]:
         transform=val_transforms,
         quick_test=args.quick_test,
         quick_test_samples=200,
+        norm_stats=train_dataset.get_norm_stats(),
     )
     
     # Class-balanced sampling
@@ -322,8 +324,10 @@ def train_epoch(
             outputs = model(images, tabular)
             
             if use_soft_labels:
+                # Unified: use soft cross-entropy when CutMix was applied
                 loss = soft_cross_entropy(outputs, soft_labels)
             else:
+                # Use configured criterion for hard labels
                 loss = criterion(outputs, labels)
             
             loss = loss / args.accumulation_steps
@@ -440,45 +444,8 @@ def save_checkpoint(
         print(f"  ✓ Saved best model with balanced_acc={metrics['val_balanced_acc']:.4f}")
 
 
-def get_layer_wise_lr_groups(model, base_lr: float, decay: float = 0.8):
-    """
-    Create parameter groups with layer-wise learning rate decay.
-    
-    Deeper (later) stages get higher LR; earlier stages get decayed LR.
-    Tabular encoder and classifier heads use full base_lr.
-    """
-    groups = []
-    seen_params = set()
-    
-    # Backbone stages: deeper stages get higher LR
-    num_stages = len(model.backbone.stages)
-    for i, stage in enumerate(reversed(model.backbone.stages)):
-        lr = base_lr * (decay ** i)
-        params = [p for p in stage.parameters() if p.requires_grad]
-        seen_params.update(id(p) for p in params)
-        if params:
-            groups.append({'params': params, 'lr': lr, 'name': f'stage_{num_stages - 1 - i}'})
-    
-    # Patch embed: lowest LR
-    patch_params = [p for p in model.backbone.patch_embed.parameters() if p.requires_grad]
-    seen_params.update(id(p) for p in patch_params)
-    if patch_params:
-        groups.append({'params': patch_params, 'lr': base_lr * (decay ** num_stages), 'name': 'patch_embed'})
-    
-    # Position embeddings and backbone norm
-    backbone_other = [p for n, p in model.backbone.named_parameters()
-                      if p.requires_grad and id(p) not in seen_params]
-    seen_params.update(id(p) for p in backbone_other)
-    if backbone_other:
-        groups.append({'params': backbone_other, 'lr': base_lr * decay, 'name': 'backbone_other'})
-    
-    # All non-backbone params (tabular encoder, fusion, classifier) at base_lr
-    other_params = [p for p in model.parameters()
-                    if p.requires_grad and id(p) not in seen_params]
-    if other_params:
-        groups.append({'params': other_params, 'lr': base_lr, 'name': 'head'})
-    
-    return groups
+# get_layer_wise_lr_groups is imported from utils.lr_groups
+# (previously duplicated here — now shared across training scripts)
 
 
 def main():

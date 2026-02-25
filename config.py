@@ -31,7 +31,7 @@ class ModelConfig:
     dropout: float = 0.1
     
     # Tabular encoder
-    num_numerical_features: int = 34
+    num_numerical_features: int = 33
     num_categorical_features: int = 6
     categorical_embedding_dim: int = 8
     tabular_hidden_dim: int = 128

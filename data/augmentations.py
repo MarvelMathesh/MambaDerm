@@ -24,14 +24,18 @@ class MixUp:
     Reference: "mixup: Beyond Empirical Risk Minimization"
     """
     
-    def __init__(self, alpha: float = 0.4, p: float = 0.5):
+    def __init__(self, alpha: float = 0.4, p: float = 0.5, num_numerical: int = 33):
         """
         Args:
-            alpha: Beta distribution parameter (higher = more mixing)
+            alpha: Beta distribution parameter for sampling lambda
             p: Probability of applying mixup
+            num_numerical: Number of leading numerical features in the
+                tabular tensor. Features beyond this index are treated as
+                categorical integers and will NOT be interpolated.
         """
         self.alpha = alpha
         self.p = p
+        self.num_numerical = num_numerical
     
     def __call__(
         self,
@@ -68,9 +72,12 @@ class MixUp:
         # Mix labels
         mixed_labels = lam * labels + (1 - lam) * labels[indices]
         
-        # Mix tabular if provided
+        # Mix tabular if provided — only numerical features, keep categoricals
         if tabular is not None:
-            mixed_tabular = lam * tabular + (1 - lam) * tabular[indices]
+            mixed_tabular = tabular.clone()
+            n = self.num_numerical
+            mixed_tabular[:, :n] = lam * tabular[:, :n] + (1 - lam) * tabular[indices, :n]
+            # Categorical features (tabular[:, n:]) keep primary sample's values
         else:
             mixed_tabular = None
         
@@ -87,14 +94,17 @@ class CutMix:
     Reference: "CutMix: Regularization Strategy to Train Strong Classifiers"
     """
     
-    def __init__(self, alpha: float = 1.0, p: float = 0.5):
+    def __init__(self, alpha: float = 1.0, p: float = 0.5, num_numerical: int = 33):
         """
         Args:
             alpha: Beta distribution parameter
             p: Probability of applying cutmix
+            num_numerical: Number of leading numerical features in the
+                tabular tensor (same as MixUp).
         """
         self.alpha = alpha
         self.p = p
+        self.num_numerical = num_numerical
     
     def _rand_bbox(
         self, size: Tuple[int, ...], lam: float
@@ -152,9 +162,12 @@ class CutMix:
         # Mix labels
         mixed_labels = lam * labels + (1 - lam) * labels[indices]
         
-        # Mix tabular proportionally
+        # Mix tabular proportionally — only numerical features
         if tabular is not None:
-            mixed_tabular = lam * tabular + (1 - lam) * tabular[indices]
+            mixed_tabular = tabular.clone()
+            n = self.num_numerical
+            mixed_tabular[:, :n] = lam * tabular[:, :n] + (1 - lam) * tabular[indices, :n]
+            # Categorical features keep primary sample's values
         else:
             mixed_tabular = None
         
@@ -174,6 +187,7 @@ class MixUpCutMix:
         cutmix_alpha: float = 1.0,
         mixup_prob: float = 0.3,
         cutmix_prob: float = 0.3,
+        num_numerical: int = 33,
     ):
         """
         Args:
@@ -182,8 +196,8 @@ class MixUpCutMix:
             mixup_prob: Probability of MixUp
             cutmix_prob: Probability of CutMix
         """
-        self.mixup = MixUp(alpha=mixup_alpha, p=1.0)
-        self.cutmix = CutMix(alpha=cutmix_alpha, p=1.0)
+        self.mixup = MixUp(alpha=mixup_alpha, p=1.0, num_numerical=num_numerical)
+        self.cutmix = CutMix(alpha=cutmix_alpha, p=1.0, num_numerical=num_numerical)
         self.mixup_prob = mixup_prob
         self.cutmix_prob = cutmix_prob
     
@@ -243,7 +257,7 @@ class RandomErasing:
                     x1 = np.random.randint(0, W - w)
                     y1 = np.random.randint(0, H - h)
                     
-                    if self.value == 'random':
+                    if isinstance(self.value, str) and self.value == 'random':
                         images[i, :, y1:y1+h, x1:x1+w] = torch.randn(C, h, w, device=images.device)
                     else:
                         images[i, :, y1:y1+h, x1:x1+w] = self.value

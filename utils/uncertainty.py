@@ -101,13 +101,17 @@ class MCDropout(nn.Module):
         mean_logits, epistemic = self.forward(x, tabular)
         probs = torch.sigmoid(mean_logits)
         
-        # Aleatoric from predictive entropy
-        # H[p(y|x)] - E[H[p(y|x,w)]]
-        # For binary: p*log(p) + (1-p)*log(1-p)
-        entropy = -(probs * torch.log(probs + 1e-8) + 
+        # Predictive entropy: H[E[p(y|x,w)]]
+        predictive_entropy = -(probs * torch.log(probs + 1e-8) + 
                    (1-probs) * torch.log(1-probs + 1e-8))
         
-        return probs, epistemic, entropy
+        # Aleatoric = Predictive Entropy - Mutual Information
+        # For MC Dropout: MI ≈ epistemic variance captures model uncertainty
+        # Aleatoric = total uncertainty - epistemic uncertainty
+        # We use entropy as total and std as epistemic proxy
+        aleatoric = torch.clamp(predictive_entropy - epistemic, min=0.0)
+        
+        return probs, epistemic, aleatoric
 
 
 class TemperatureScaling(nn.Module):
@@ -166,7 +170,7 @@ class TemperatureScaling(nn.Module):
         all_labels = torch.cat(all_labels).to(device)
         
         # Optimize temperature
-        self.temperature = nn.Parameter(torch.tensor(1.5).to(device))
+        self.temperature.data.fill_(1.5)
         optimizer = torch.optim.LBFGS([self.temperature], lr=lr, max_iter=max_iter)
         
         def closure():

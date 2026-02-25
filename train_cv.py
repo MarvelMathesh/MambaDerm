@@ -303,8 +303,9 @@ def main():
         seed_results = []
         
         for fold in folds:
-            # Set different seed per fold for diversity
-            args.seed = seed + fold
+            # Use unique seed per (seed, fold) combination to avoid collisions
+            # e.g. seed=42, fold=1 must differ from seed=43, fold=0
+            args.seed = seed * args.n_folds + fold
             set_seed(args.seed)
             
             fold_result = train_single_fold(args, fold)

@@ -10,7 +10,7 @@ Reference: VMamba, Swin Transformer hierarchical design
 """
 
 import math
-from typing import Optional, Tuple, List
+from typing import Optional, Sequence, Tuple, List
 
 import torch
 import torch.nn as nn
@@ -170,7 +170,7 @@ class HierarchicalMambaStage(nn.Module):
         expand: int = 2,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
-        drop_path: float = 0.0,
+        drop_path_rates: Optional[Sequence[float]] = None,
         downsample: bool = True,
         out_dim: Optional[int] = None,
     ):
@@ -178,8 +178,9 @@ class HierarchicalMambaStage(nn.Module):
         self.dim = dim
         self.depth = depth
         
-        # Stochastic depth - pass per-layer drop path rates
-        dpr = [x.item() for x in torch.linspace(0, drop_path, depth)]
+        # Per-layer stochastic depth rates from the global schedule
+        if drop_path_rates is None:
+            drop_path_rates = [0.0] * depth
         
         # Mamba layers with stochastic depth
         self.layers = nn.ModuleList([
@@ -190,7 +191,7 @@ class HierarchicalMambaStage(nn.Module):
                 expand=expand,
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
-                drop_path=dpr[i],
+                drop_path=drop_path_rates[i],
                 bidirectional=True,
             )
             for i in range(depth)
@@ -278,10 +279,11 @@ class HierarchicalMambaBackbone(nn.Module):
             initial_H = img_size // 4
             initial_W = img_size // 4
         else:
+            # Use a proper channel-only LayerNorm via a wrapper
             self.patch_embed = nn.Sequential(
                 nn.Conv2d(in_channels, embed_dim, kernel_size=4, stride=4),
-                nn.LayerNorm([embed_dim, img_size // 4, img_size // 4]),
             )
+            self._patch_embed_norm = nn.LayerNorm(embed_dim)
             initial_H = img_size // 4
             initial_W = img_size // 4
         
@@ -310,7 +312,7 @@ class HierarchicalMambaBackbone(nn.Module):
                 expand=expand,
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
-                drop_path=dpr[cur],
+                drop_path_rates=dpr[cur:cur + depths[i]],
                 downsample=(i < self.num_stages - 1),  # No downsample at last stage
                 out_dim=dims[i + 1] if i < self.num_stages - 1 else None,
             )
@@ -339,6 +341,7 @@ class HierarchicalMambaBackbone(nn.Module):
         else:
             x = self.patch_embed(x)
             x = rearrange(x, 'b c h w -> b (h w) c')
+            x = self._patch_embed_norm(x)
             H, W = self.initial_H, self.initial_W
         
         # Add position embeddings

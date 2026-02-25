@@ -210,12 +210,17 @@ class UnifiedClinicalPredictor:
         return transformed['image']
     
     def _get_isic_tabular(self) -> torch.Tensor:
-        """Default tabular for ISIC model (NaN triggers missingness embeddings)."""
-        return torch.full((1, 40), float('nan'))
+        """Default tabular for ISIC model.
+        
+        Uses zeros for numerical features and 0 (unknown/missing class) for
+        categorical features, avoiding NaN→int64 undefined behavior.
+        """
+        # 33 numerical (zeros) + 6 categorical (zeros = unknown class index)
+        return torch.zeros(1, 39)
     
     def _get_ham_tabular(self) -> torch.Tensor:
-        """Default tabular for HAM model (NaN triggers missingness embeddings)."""
-        return torch.full((1, 19), float('nan'))
+        """Default tabular for HAM model (all features are pre-encoded as float)."""
+        return torch.zeros(1, 19)
     
     @torch.no_grad()
     def _predict_isic(self, image_np: np.ndarray) -> float:
