@@ -2,9 +2,11 @@
 Uncertainty Quantification and Calibration
 
 Provides uncertainty estimation for clinical safety:
+- Evidential uncertainty from Dirichlet head (K/Σα)
 - Monte Carlo Dropout for epistemic uncertainty
 - Temperature scaling for calibration
 - Expected Calibration Error (ECE) computation
+- Conformal Prediction for distribution-free coverage
 - Out-of-Distribution (OOD) detection
 """
 
@@ -397,3 +399,127 @@ class SafePredictor(nn.Module):
             'is_ood': is_ood,
             'is_reliable': is_reliable,
         }
+
+
+class EvidentialUncertainty:
+    """
+    Evidential uncertainty from Dirichlet concentration parameters.
+    
+    Given α (Dirichlet concentrations), provides:
+    - Epistemic uncertainty: K / Σα (high when model lacks evidence)
+    - Aleatoric uncertainty: entropy of expected categorical distribution
+    - Prediction: α / Σα (expected class probabilities)
+    """
+    
+    @staticmethod
+    def from_alpha(alpha: torch.Tensor):
+        """
+        Compute uncertainty metrics from Dirichlet α.
+        
+        Args:
+            alpha: (B, K) concentration parameters
+            
+        Returns:
+            dict with probs, epistemic, aleatoric, total_uncertainty
+        """
+        S = alpha.sum(dim=-1, keepdim=True)
+        probs = alpha / S
+        K = alpha.shape[-1]
+        
+        # Epistemic: K / S (how much total evidence)
+        epistemic = (K / S).squeeze(-1)
+        
+        # Aleatoric: entropy of expected distribution
+        aleatoric = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)
+        
+        # Total = epistemic + aleatoric
+        total = epistemic + aleatoric
+        
+        return {
+            'probs': probs,
+            'epistemic': epistemic,
+            'aleatoric': aleatoric,
+            'total_uncertainty': total,
+            'dirichlet_strength': S.squeeze(-1),
+        }
+
+
+class ConformalPredictor:
+    """
+    Split Conformal Prediction for distribution-free coverage.
+    
+    Provides prediction sets with guaranteed coverage probability:
+        P(Y ∈ C(X)) ≥ 1 - α
+    
+    Uses nonconformity scores from calibration set to determine
+    adaptive thresholds.
+    
+    Usage:
+        cp = ConformalPredictor(alpha=0.1)  # 90% coverage
+        cp.calibrate(cal_scores, cal_labels)
+        pred_sets = cp.predict(test_scores)
+    """
+    
+    def __init__(self, alpha: float = 0.1):
+        self.alpha = alpha
+        self.threshold = None
+    
+    def calibrate(
+        self,
+        scores: np.ndarray,
+        labels: np.ndarray,
+    ):
+        """
+        Calibrate conformal threshold from calibration set.
+        
+        Args:
+            scores: (N,) model confidence scores (probability of positive class)
+            labels: (N,) true binary labels
+        """
+        n = len(scores)
+        
+        # Nonconformity score: 1 - P(correct class)
+        correct_probs = np.where(labels == 1, scores, 1 - scores)
+        nonconformity = 1 - correct_probs
+        
+        # Quantile with finite-sample correction
+        q_level = np.ceil((n + 1) * (1 - self.alpha)) / n
+        q_level = min(q_level, 1.0)
+        self.threshold = np.quantile(nonconformity, q_level)
+        
+        print(f"Conformal threshold: {self.threshold:.4f} (α={self.alpha})")
+        return self.threshold
+    
+    def predict(self, scores: np.ndarray) -> np.ndarray:
+        """
+        Generate prediction sets.
+        
+        Args:
+            scores: (N,) predicted probability of positive class
+            
+        Returns:
+            pred_sets: (N, 2) boolean array [include_neg, include_pos]
+        """
+        if self.threshold is None:
+            raise ValueError("Must calibrate before prediction")
+        
+        # Include class if nonconformity score ≤ threshold
+        include_pos = (1 - scores) <= self.threshold
+        include_neg = scores <= self.threshold
+        
+        return np.column_stack([include_neg, include_pos])
+    
+    def get_set_sizes(self, pred_sets: np.ndarray) -> np.ndarray:
+        """Return size of each prediction set (0, 1, or 2)."""
+        return pred_sets.sum(axis=1)
+    
+    def get_coverage(
+        self,
+        pred_sets: np.ndarray,
+        labels: np.ndarray,
+    ) -> float:
+        """Compute empirical coverage on test set."""
+        covered = np.array([
+            pred_sets[i, int(labels[i])] for i in range(len(labels))
+        ])
+        return covered.mean()

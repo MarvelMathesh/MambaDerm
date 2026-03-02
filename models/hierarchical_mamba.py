@@ -20,12 +20,12 @@ from einops import rearrange
 from .mamba_block import VisionMambaBlock, VMambaLayer
 
 
-class PatchMerging(nn.Module):
+class ConvDownsample(nn.Module):
     """
-    Patch merging layer for downsampling between stages.
+    Depthwise-separable convolution for downsampling between stages.
     
-    Reduces spatial resolution by 2× while doubling channels.
-    Similar to Swin Transformer's patch merging.
+    Preserves more spatial information than PatchMerging (2×2 concat).
+    Uses strided depthwise conv + pointwise expansion.
     """
     
     def __init__(self, dim: int, out_dim: Optional[int] = None):
@@ -33,39 +33,66 @@ class PatchMerging(nn.Module):
         self.dim = dim
         self.out_dim = out_dim or dim * 2
         
-        # Merge 2×2 patches into 1
-        self.reduction = nn.Linear(4 * dim, self.out_dim, bias=False)
-        self.norm = nn.LayerNorm(4 * dim)
+        # Depthwise conv with stride 2 for spatial reduction
+        self.dw_conv = nn.Conv2d(
+            dim, dim, kernel_size=3, stride=2, padding=1,
+            groups=dim, bias=False,
+        )
+        # Pointwise conv for channel expansion
+        self.pw_conv = nn.Conv2d(dim, self.out_dim, kernel_size=1, bias=False)
+        self.norm = nn.LayerNorm(self.out_dim)
     
     def forward(self, x: torch.Tensor, H: int, W: int) -> Tuple[torch.Tensor, int, int]:
-        """
-        Args:
-            x: (B, H*W, C)
-            H, W: Spatial dimensions
-            
-        Returns:
-            x: (B, H/2*W/2, 2C)
-            H_new, W_new: New spatial dimensions
-        """
         B, L, C = x.shape
-        assert L == H * W, f"Input length {L} doesn't match H*W {H*W}"
-        assert H % 2 == 0 and W % 2 == 0, f"H ({H}) and W ({W}) must be even"
-        
-        x = x.view(B, H, W, C)
-        
-        # Merge 2×2 patches
-        x0 = x[:, 0::2, 0::2, :]  # B, H/2, W/2, C
-        x1 = x[:, 1::2, 0::2, :]
-        x2 = x[:, 0::2, 1::2, :]
-        x3 = x[:, 1::2, 1::2, :]
-        
-        x = torch.cat([x0, x1, x2, x3], dim=-1)  # B, H/2, W/2, 4C
-        x = x.view(B, -1, 4 * C)
-        
+        x = x.reshape(B, H, W, C).permute(0, 3, 1, 2)  # B,C,H,W
+        x = self.dw_conv(x)
+        x = self.pw_conv(x)
+        H_new, W_new = x.shape[2], x.shape[3]
+        x = x.permute(0, 2, 3, 1).reshape(B, H_new * W_new, self.out_dim)  # B,L',C'
         x = self.norm(x)
-        x = self.reduction(x)
+        return x, H_new, W_new
+
+
+class SpatialChannelAttention(nn.Module):
+    """
+    CBAM-lite: Channel Attention + Spatial Attention.
+    
+    Sequentially applies channel and spatial attention for
+    feature refinement after each stage.
+    """
+    
+    def __init__(self, dim: int, reduction: int = 8):
+        super().__init__()
+        # Channel attention (SE-style)
+        self.channel_gate = nn.Sequential(
+            nn.Linear(dim, dim // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(dim // reduction, dim),
+            nn.Sigmoid(),
+        )
+        # Spatial attention
+        self.spatial_conv = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False),
+            nn.Sigmoid(),
+        )
+    
+    def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        """x: (B, H*W, C)"""
+        B, L, C = x.shape
         
-        return x, H // 2, W // 2
+        # Channel attention: GAP → FC → scale
+        gap = x.mean(dim=1)  # B, C
+        ch_gate = self.channel_gate(gap).unsqueeze(1)  # B, 1, C
+        x = x * ch_gate
+        
+        # Spatial attention: concat(max, mean) along channel → conv → scale
+        x_2d = x.reshape(B, H, W, C).permute(0, 3, 1, 2)  # B,C,H,W
+        sp_max = x_2d.max(dim=1, keepdim=True)[0]  # B,1,H,W
+        sp_mean = x_2d.mean(dim=1, keepdim=True)  # B,1,H,W
+        sp_gate = self.spatial_conv(torch.cat([sp_max, sp_mean], dim=1))  # B,1,H,W
+        x_2d = x_2d * sp_gate
+        
+        return x_2d.permute(0, 2, 3, 1).reshape(B, L, C)
 
 
 class MultiScalePatchEmbed(nn.Module):
@@ -158,7 +185,7 @@ class HierarchicalMambaStage(nn.Module):
     """
     Single stage of hierarchical Mamba backbone.
     
-    Contains multiple VMamba layers followed by optional downsampling.
+    Contains multiple VMamba layers + CBAM attention + optional downsampling.
     """
     
     def __init__(
@@ -173,6 +200,7 @@ class HierarchicalMambaStage(nn.Module):
         drop_path_rates: Optional[Sequence[float]] = None,
         downsample: bool = True,
         out_dim: Optional[int] = None,
+        use_freq_branch: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -182,7 +210,7 @@ class HierarchicalMambaStage(nn.Module):
         if drop_path_rates is None:
             drop_path_rates = [0.0] * depth
         
-        # Mamba layers with stochastic depth
+        # Mamba layers with cross-scan and stochastic depth
         self.layers = nn.ModuleList([
             VMambaLayer(
                 d_model=dim,
@@ -193,13 +221,17 @@ class HierarchicalMambaStage(nn.Module):
                 dropout=dropout,
                 drop_path=drop_path_rates[i],
                 bidirectional=True,
+                use_freq_branch=use_freq_branch and (i == 0),  # freq on first layer only
             )
             for i in range(depth)
         ])
         
+        # CBAM attention after stage
+        self.attention = SpatialChannelAttention(dim)
+        
         # Downsampling
         if downsample:
-            self.downsample = PatchMerging(dim, out_dim)
+            self.downsample = ConvDownsample(dim, out_dim)
         else:
             self.downsample = None
     
@@ -216,7 +248,10 @@ class HierarchicalMambaStage(nn.Module):
             H_new, W_new: New spatial dimensions
         """
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, H, W)
+        
+        # CBAM refinement
+        x = self.attention(x, H, W)
         
         if self.downsample is not None:
             x, H, W = self.downsample(x, H, W)
@@ -299,7 +334,7 @@ class HierarchicalMambaBackbone(nn.Module):
         total_depth = sum(depths)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, total_depth)]
         
-        # Build stages
+        # Build stages (freq branch only in stage 1 for texture sensitivity)
         self.stages = nn.ModuleList()
         cur = 0
         
@@ -315,6 +350,7 @@ class HierarchicalMambaBackbone(nn.Module):
                 drop_path_rates=dpr[cur:cur + depths[i]],
                 downsample=(i < self.num_stages - 1),  # No downsample at last stage
                 out_dim=dims[i + 1] if i < self.num_stages - 1 else None,
+                use_freq_branch=(i == 0),  # Frequency branch on first stage
             )
             self.stages.append(stage)
             cur += depths[i]

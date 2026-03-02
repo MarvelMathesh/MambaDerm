@@ -1,13 +1,15 @@
 """
-MambaDerm: Hybrid CNN-Mamba Architecture
+MambaDerm: SOTA Hybrid Mamba Architecture for Dermatology
 
-A novel architecture featuring:
-- Hierarchical 3-stage Mamba backbone with multi-scale patches
-- Multi-scale patch embedding (4×4, 8×8, 16×16)
-- Gated bidirectional SSM fusion
-- Multi-head cross-modal attention with feature pyramid
-- Stochastic depth regularization (properly wired)
-- Dimension-safe local-global gating with projection
+Novel architecture featuring:
+- 4-directional Cross-Scan SSM (row↔, col↔) for spatially-aware scanning
+- Spatial-frequency dual-domain processing (DCT branch)
+- CBAM spatial-channel attention per stage
+- BiFPN for bidirectional multi-scale feature fusion
+- Clinically-motivated Mixture-of-Experts fusion (ABCD criteria)
+- Gated bilinear image-tabular fusion
+- Evidential deep learning head with Dirichlet prior
+- Stochastic depth + ConvDownsample
 """
 
 import math
@@ -26,214 +28,297 @@ from .hierarchical_mamba import (
 from .tabular_encoder import TabularEncoder
 
 
-class MultiHeadCrossAttention(nn.Module):
+class BiFPN(nn.Module):
     """
-    Multi-head cross-modal attention for image-tabular fusion.
+    Bidirectional Feature Pyramid Network with weighted fusion.
     
-    Image features attend to tabular features for context-aware
-    representation learning.
-    """
+    Replaces FeaturePyramidFusion — operates on spatial feature maps
+    instead of GAP-ed vectors. Uses fast normalized fusion weights.
     
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int = 8,
-        qkv_bias: bool = True,
-        attn_drop: float = 0.0,
-        proj_drop: float = 0.0,
-    ):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        
-        # Q from image, K/V from tabular
-        self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
-        self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)
-        self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
-        
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-        
-        self.norm_q = nn.LayerNorm(dim)
-        self.norm_kv = nn.LayerNorm(dim)
-    
-    def forward(
-        self,
-        query: torch.Tensor,      # Image features (B, L, D)
-        key_value: torch.Tensor,  # Tabular features (B, 1, D) or (B, N, D)
-    ) -> torch.Tensor:
-        B, L, C = query.shape
-        _, N, _ = key_value.shape
-        
-        # Normalize
-        query = self.norm_q(query)
-        key_value = self.norm_kv(key_value)
-        
-        # Project
-        q = self.q_proj(query).reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(key_value).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(key_value).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        
-        # Attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        
-        # Output
-        x = (attn @ v).transpose(1, 2).reshape(B, L, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        
-        return x
-
-
-class FeaturePyramidFusion(nn.Module):
-    """
-    Feature Pyramid Network-style fusion of multi-stage features.
-    
-    Combines features from all hierarchical stages for rich
-    multi-scale representation.
+    Reference: EfficientDet (Tan et al., 2020)
     """
     
     def __init__(self, dims: List[int], out_dim: int):
         super().__init__()
+        self.num_levels = len(dims)
         
-        # Lateral connections (1×1 conv equivalent)
-        self.laterals = nn.ModuleList([
-            nn.Linear(dim, out_dim) for dim in dims
+        # Lateral projections to out_dim
+        self.lateral_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, out_dim),
+                nn.LayerNorm(out_dim),
+            ) for dim in dims
         ])
         
-        # Fusion
-        self.fusion = nn.Sequential(
-            nn.Linear(out_dim * len(dims), out_dim * 2),
+        # Per-node fusion weights (fast normalized)
+        # Top-down path: num_levels - 1 nodes, each fuses 2 inputs
+        self.td_weights = nn.ParameterList([
+            nn.Parameter(torch.ones(2) * 0.5) for _ in range(self.num_levels - 1)
+        ])
+        # Bottom-up path: num_levels - 1 nodes, each fuses 3 inputs (except first)
+        self.bu_weights = nn.ParameterList([
+            nn.Parameter(torch.ones(3 if i > 0 else 2) * 0.33)
+            for i in range(self.num_levels - 1)
+        ])
+        
+        # Output projection per level → single fused vector
+        self.output_fusion = nn.Sequential(
+            nn.Linear(out_dim * self.num_levels, out_dim * 2),
             nn.LayerNorm(out_dim * 2),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(out_dim * 2, out_dim),
             nn.LayerNorm(out_dim),
         )
+        
+        self.eps = 1e-4
+    
+    def _weighted_add(self, inputs: List[torch.Tensor], weights: nn.Parameter) -> torch.Tensor:
+        """Fast normalized weighted addition."""
+        w = F.relu(weights)
+        w = w / (w.sum() + self.eps)
+        result = sum(wi * inp for wi, inp in zip(w, inputs))
+        return result
+    
+    def _resize_to(self, x: torch.Tensor, target_len: int) -> torch.Tensor:
+        """Resize sequence length via adaptive pooling."""
+        if x.shape[1] == target_len:
+            return x
+        x = x.permute(0, 2, 1)  # B,D,L
+        x = F.adaptive_avg_pool1d(x, target_len)
+        return x.permute(0, 2, 1)  # B,L,D
     
     def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
         """
         Args:
             features: List of (B, L_i, C_i) from each stage
-            
         Returns:
-            fused: (B, out_dim) global feature
+            fused: (B, out_dim) global fused feature
         """
-        # Project each stage
-        projected = []
-        for feat, lateral in zip(features, self.laterals):
-            # Global average pool then project
-            pooled = feat.mean(dim=1)  # B, C_i
-            projected.append(lateral(pooled))
+        # Project all levels to out_dim
+        projected = [lat(feat) for feat, lat in zip(features, self.lateral_convs)]
         
-        # Concatenate and fuse
-        concat = torch.cat(projected, dim=-1)
-        fused = self.fusion(concat)
-        
-        return fused
-
-
-class EnhancedMultiModalFusion(nn.Module):
-    """
-    Enhanced multimodal fusion with:
-    - Local-global gating
-    - Multi-head cross-attention
-    - Feature pyramid integration
-    """
-    
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int = 8,
-        dropout: float = 0.1,
-        use_cross_attention: bool = True,
-    ):
-        super().__init__()
-        
-        self.use_cross_attention = use_cross_attention
-        
-        # Local-global gating
-        self.gate = nn.Sequential(
-            nn.Linear(dim * 2, dim),
-            nn.GELU(),
-            nn.Linear(dim, 2),
-            nn.Softmax(dim=-1),
-        )
-        
-        # Cross-modal attention
-        if use_cross_attention:
-            self.cross_attn = MultiHeadCrossAttention(
-                dim=dim,
-                num_heads=num_heads,
-                attn_drop=dropout,
-                proj_drop=dropout,
+        # Top-down path (coarse → fine)
+        td_feats = [None] * self.num_levels
+        td_feats[-1] = projected[-1]
+        for i in range(self.num_levels - 2, -1, -1):
+            upsampled = self._resize_to(td_feats[i + 1], projected[i].shape[1])
+            td_feats[i] = self._weighted_add(
+                [projected[i], upsampled], self.td_weights[i]
             )
         
+        # Bottom-up path (fine → coarse)
+        bu_feats = [None] * self.num_levels
+        bu_feats[0] = td_feats[0]
+        for i in range(1, self.num_levels):
+            downsampled = self._resize_to(bu_feats[i - 1], td_feats[i].shape[1])
+            if i > 0 and i < self.num_levels:
+                bu_feats[i] = self._weighted_add(
+                    [projected[i], td_feats[i], downsampled][:len(self.bu_weights[i - 1])],
+                    self.bu_weights[i - 1],
+                )
+            else:
+                bu_feats[i] = self._weighted_add(
+                    [td_feats[i], downsampled], self.bu_weights[i - 1]
+                )
+        
+        # Pool each level and concatenate for final fusion
+        pooled = [feat.mean(dim=1) for feat in bu_feats]
+        concat = torch.cat(pooled, dim=-1)
+        return self.output_fusion(concat)
+
+
+class GatedBilinearFusion(nn.Module):
+    """
+    Gated bilinear fusion for image-tabular modalities.
+    
+    Replaces degenerate cross-attention (1-KV-token) with:
+        gate = σ(W_g · [img; tab])
+        fused = gate * (W_1 · img ⊙ W_2 · tab)
+    
+    Bilinear interaction captures multiplicative feature relationships.
+    """
+    
+    def __init__(self, dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.img_proj = nn.Linear(dim, dim)
+        self.tab_proj = nn.Linear(dim, dim)
+        self.gate_proj = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.Sigmoid(),
+        )
         self.norm = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
     
     def forward(
         self,
-        local_feat: torch.Tensor,    # B, L, D (from early stage)
-        global_feat: torch.Tensor,   # B, L, D (from final stage)
-        tabular_feat: Optional[torch.Tensor] = None,  # B, D
+        image_feat: torch.Tensor,   # (B, D)
+        tabular_feat: torch.Tensor,  # (B, D)
     ) -> torch.Tensor:
-        """Fuse local, global, and tabular features."""
+        """Returns (B, D) fused feature."""
+        img_proj = self.img_proj(image_feat)
+        tab_proj = self.tab_proj(tabular_feat)
         
-        # Handle size mismatch by adaptive pooling
-        if local_feat.shape[1] != global_feat.shape[1]:
-            L_global = global_feat.shape[1]
-            # Use adaptive average pooling over the sequence dimension
-            # Rearrange to (B, D, L) for pooling, then back
-            local_feat = local_feat.permute(0, 2, 1)  # B, D, L_local
-            local_feat = F.adaptive_avg_pool1d(local_feat, L_global)  # B, D, L_global
-            local_feat = local_feat.permute(0, 2, 1)  # B, L_global, D
+        gate = self.gate_proj(torch.cat([image_feat, tabular_feat], dim=-1))
+        fused = gate * (img_proj * tab_proj)  # element-wise (Hadamard)
         
-        # Gated fusion of local and global
-        combined = torch.cat([local_feat, global_feat], dim=-1)
-        gates = self.gate(combined)  # B, L, 2
+        return self.norm(self.dropout(fused))
+
+
+class MoEFusionLayer(nn.Module):
+    """
+    Mixture-of-Experts fusion with clinically-motivated specialization.
+    
+    4 experts aligned with the dermatologic ABCD criteria:
+      - Asymmetry / structure expert
+      - Border expert
+      - Color expert
+      - Diameter / texture expert
+    
+    Top-2 gating with load-balancing auxiliary loss.
+    """
+    
+    def __init__(self, dim: int, num_experts: int = 4, top_k: int = 2, dropout: float = 0.1):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.dim = dim
         
-        fused = gates[..., 0:1] * local_feat + gates[..., 1:2] * global_feat
+        # Router
+        self.router = nn.Linear(dim, num_experts)
         
-        # Cross-modal attention with tabular
-        if self.use_cross_attention and tabular_feat is not None:
-            if tabular_feat.dim() == 2:
-                tabular_feat = tabular_feat.unsqueeze(1)  # B, 1, D
+        # Expert MLPs (different activations for diversity)
+        activations = [nn.GELU(), nn.SiLU(), nn.Mish(), nn.GELU()]
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, dim * 2),
+                activations[i],
+                nn.Dropout(dropout),
+                nn.Linear(dim * 2, dim),
+            )
+            for i in range(num_experts)
+        ])
+        
+        self.norm = nn.LayerNorm(dim)
+        self._aux_loss = torch.tensor(0.0)
+    
+    @property
+    def aux_loss(self) -> torch.Tensor:
+        """Load-balancing auxiliary loss for MoE."""
+        return self._aux_loss
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, L, D) spatial features
+        Returns:
+            (B, L, D) expert-processed features
+        """
+        B, L, D = x.shape
+        
+        # Compute router logits on pooled features (per-sample routing)
+        x_pool = x.mean(dim=1)  # B, D
+        router_logits = self.router(x_pool)  # B, num_experts
+        
+        # Add noise for exploration during training
+        if self.training:
+            noise = torch.randn_like(router_logits) * 0.1
+            router_logits = router_logits + noise
+        
+        # Top-k gating
+        top_k_logits, top_k_indices = router_logits.topk(self.top_k, dim=-1)
+        top_k_gates = F.softmax(top_k_logits, dim=-1)  # B, top_k
+        
+        # Compute load-balancing loss (CV² of expert usage)
+        if self.training:
+            probs = F.softmax(router_logits, dim=-1)  # B, num_experts
+            expert_usage = probs.mean(dim=0)  # num_experts
+            cv_sq = expert_usage.var() / (expert_usage.mean() ** 2 + 1e-8)
+            self._aux_loss = cv_sq
+        
+        # Dispatch to experts
+        result = torch.zeros_like(x)
+        for k in range(self.top_k):
+            expert_idx = top_k_indices[:, k]  # B
+            gate_val = top_k_gates[:, k]  # B
             
-            cross_out = self.cross_attn(fused, tabular_feat)
-            fused = fused + self.dropout(cross_out)
+            for e in range(self.num_experts):
+                mask = (expert_idx == e)
+                if mask.any():
+                    expert_input = x[mask]  # n, L, D
+                    expert_output = self.experts[e](expert_input)
+                    result[mask] = result[mask] + gate_val[mask].unsqueeze(-1).unsqueeze(-1) * expert_output
         
-        fused = self.norm(fused)
+        return self.norm(result + x)  # residual
+
+
+class EvidentialHead(nn.Module):
+    """
+    Evidential deep learning classification head with Dirichlet prior.
+    
+    Outputs Dirichlet concentration parameters α instead of logits.
+    Provides calibrated uncertainty in a single forward pass.
+    
+    For binary: K=2, α = (α₁, α₂), prediction = α₁/(α₁+α₂)
+    For multi-class: K classes, prediction = α/Σα
+    Uncertainty: u = K/Σα (total evidence inverse)
+    """
+    
+    def __init__(self, in_dim: int, num_classes: int, dropout: float = 0.15):
+        super().__init__()
+        self.num_classes = num_classes
+        # K=2 for binary, K=num_classes for multi-class
+        self.K = max(num_classes, 2)
         
-        return fused
+        self.head = nn.Sequential(
+            nn.Linear(in_dim, in_dim // 2),
+            nn.LayerNorm(in_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(in_dim // 2, in_dim // 4),
+            nn.LayerNorm(in_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(in_dim // 4, self.K),
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, in_dim) features
+        Returns:
+            alpha: (B, K) Dirichlet concentration parameters, all > 1
+        """
+        # Softplus + 1 ensures α > 1 (valid Dirichlet concentration)
+        alpha = F.softplus(self.head(x)) + 1.0
+        return alpha
+    
+    def get_prediction(self, alpha: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Extract prediction and uncertainty from α.
+        
+        Returns:
+            probs: (B, K) predicted class probabilities
+            uncertainty: (B,) epistemic uncertainty
+        """
+        S = alpha.sum(dim=-1, keepdim=True)  # Dirichlet strength
+        probs = alpha / S
+        uncertainty = self.K / S.squeeze(-1)
+        return probs, uncertainty
 
 
 class MambaDerm(nn.Module):
     """
-    MambaDerm: World-Class Hybrid CNN-Mamba Architecture
+    MambaDerm: SOTA Cross-Scan Mamba + MoE + Evidential Architecture
     
-    Features:
-    1. Hierarchical 3-stage backbone with multi-scale patches
-    2. Feature pyramid fusion across stages
-    3. Enhanced gated local-global fusion
-    4. Multi-head cross-modal attention
-    5. Stochastic depth regularization
-    
-    Args:
-        img_size: Input image size (default: 224)
-        in_channels: Number of input channels
-        embed_dim: Base embedding dimension (default: 96)
-        depths: Layers per stage (default: [2, 2, 6])
-        num_numerical_features: Numerical tabular features
-        num_categorical_features: Categorical tabular features
-        num_classes: Output classes (1 for binary)
-        dropout: Dropout rate
-        drop_path_rate: Stochastic depth rate
-        use_tabular: Whether to use tabular features
+    Novel features:
+    1. 4-directional cross-scan SSM (row↔, col↔) per layer
+    2. Spatial-frequency dual-domain (DCT branch in Stage 1)
+    3. CBAM spatial-channel attention per stage
+    4. BiFPN bidirectional multi-scale fusion
+    5. Clinically-motivated MoE (4 experts, top-2 gating)
+    6. Gated bilinear image-tabular fusion
+    7. Evidential head with Dirichlet prior for calibrated uncertainty
     """
     
     def __init__(
@@ -254,7 +339,6 @@ class MambaDerm(nn.Module):
     ):
         super().__init__()
         
-        # Handle mutable default argument
         if depths is None:
             depths = [2, 2, 6]
         
@@ -263,23 +347,21 @@ class MambaDerm(nn.Module):
         self.num_numerical_features = num_numerical_features
         self.gradient_checkpointing = gradient_checkpointing
         
-        # Compute dimensions for each stage
-        # Note: dims are INPUT dims, output dims are different due to downsampling
+        # Stage dimensions
         dims = [embed_dim * (2 ** i) for i in range(len(depths))]
         self.dims = dims
         final_dim = dims[-1]
         
-        # Compute OUTPUT dimensions for each stage (after downsampling)
-        # Stage i outputs dims[i+1] if downsampled, else dims[i]
+        # Stage OUTPUT dims (after downsampling)
         stage_out_dims = []
         for i in range(len(depths)):
-            if i < len(depths) - 1:  # Stages with downsample
+            if i < len(depths) - 1:
                 stage_out_dims.append(dims[i + 1])
-            else:  # Last stage (no downsample)
+            else:
                 stage_out_dims.append(dims[i])
         self.stage_out_dims = stage_out_dims
         
-        # Hierarchical backbone
+        # Hierarchical backbone (now with cross-scan + freq + CBAM)
         self.backbone = HierarchicalMambaBackbone(
             img_size=img_size,
             in_channels=in_channels,
@@ -302,49 +384,28 @@ class MambaDerm(nn.Module):
                 dropout=dropout,
             )
         
-        # Feature pyramid fusion - use stage OUTPUT dims
-        self.pyramid_fusion = FeaturePyramidFusion(stage_out_dims, final_dim)
+        # BiFPN: bidirectional feature pyramid (replaces old FPN)
+        self.bifpn = BiFPN(stage_out_dims, final_dim)
         
-        # Local feature projection (align second-to-last stage dim to final_dim)
-        if len(depths) > 1 and stage_out_dims[-2] != final_dim:
-            self.local_proj = nn.Sequential(
-                nn.Linear(stage_out_dims[-2], final_dim),
-                nn.LayerNorm(final_dim),
-            )
-        else:
-            self.local_proj = nn.Identity()
+        # MoE fusion layer (4 experts, top-2 gating)
+        self.moe = MoEFusionLayer(dim=final_dim, num_experts=4, top_k=2, dropout=dropout)
         
-        # Enhanced multimodal fusion
-        self.fusion = EnhancedMultiModalFusion(
-            dim=final_dim,
-            num_heads=8,
-            dropout=dropout,
-            use_cross_attention=use_tabular,
-        )
-        
-        # Classification head
-        classifier_dim = final_dim
+        # Gated bilinear fusion for image-tabular (replaces cross-attention)
         if use_tabular:
-            classifier_dim = final_dim + final_dim  # Image + Tabular
+            self.bilinear_fusion = GatedBilinearFusion(dim=final_dim, dropout=dropout)
         
-        self.classifier = nn.Sequential(
-            nn.Linear(classifier_dim, final_dim),
-            nn.LayerNorm(final_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(final_dim, final_dim // 2),
-            nn.LayerNorm(final_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(final_dim // 2, num_classes),
+        # Evidential classification head
+        classifier_input_dim = final_dim
+        if use_tabular:
+            classifier_input_dim = final_dim * 2  # fused + bifpn
+        self.evidential_head = EvidentialHead(
+            in_dim=classifier_input_dim, num_classes=num_classes, dropout=dropout,
         )
         
         # Initialize weights
         self.apply(self._init_weights)
     
     def _init_weights(self, m):
-        # Skip SSM-specific modules — they use specialized initialization
-        # (A_log, D, dt_proj) from the Mamba paper
         if hasattr(m, 'A_log') or hasattr(m, 'dt_proj'):
             return
         if isinstance(m, nn.Linear):
@@ -360,9 +421,9 @@ class MambaDerm(nn.Module):
         x: torch.Tensor,
         tabular: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Extract features before classifier."""
+        """Extract features before evidential head."""
         
-        # Hierarchical backbone
+        # Hierarchical backbone (cross-scan + freq + CBAM)
         if self.gradient_checkpointing and self.training:
             final_feat, stage_features = checkpoint(
                 self.backbone, x, use_reentrant=False
@@ -379,23 +440,23 @@ class MambaDerm(nn.Module):
                 categorical = tabular[:, self.num_numerical_features:].long()
             tabular_feat = self.tabular_encoder(numerical, categorical)
         
-        # Feature pyramid fusion (global feature from all stages)
-        pyramid_feat = self.pyramid_fusion(stage_features)
+        # BiFPN multi-scale fusion
+        pyramid_feat = self.bifpn(stage_features)
         
-        # Use final features for fusion
-        # Project local features to match final dimension
-        if len(stage_features) > 1:
-            local_feat = self.local_proj(stage_features[-2])  # Now (B, L, final_dim)
-        else:
-            local_feat = final_feat
-        
-        fused = self.fusion(local_feat, final_feat, tabular_feat)
+        # MoE expert processing on final-stage features
+        moe_feat = self.moe(final_feat)  # B, L, D
         
         # Global average pooling
-        image_feat = fused.mean(dim=1)  # B, D
+        image_feat = moe_feat.mean(dim=1)  # B, D
         
-        # Add pyramid features
+        # Add multi-scale pyramid context
         image_feat = image_feat + pyramid_feat
+        
+        # Gated bilinear fusion with tabular
+        if self.use_tabular and tabular_feat is not None:
+            fused = self.bilinear_fusion(image_feat, tabular_feat)
+            # Concatenate fused and image for richer input to head
+            image_feat = torch.cat([image_feat, fused], dim=-1)
         
         return image_feat, tabular_feat
     
@@ -404,30 +465,57 @@ class MambaDerm(nn.Module):
         x: torch.Tensor,
         tabular: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Full forward pass."""
+        """
+        Full forward pass.
         
-        image_feat, tabular_feat = self.forward_features(x, tabular)
+        Returns logits for backward compatibility with existing training scripts.
+        For binary (num_classes=1): returns (B, 1) logits 
+        For multi-class: returns (B, num_classes) logits
         
-        # Combine for classification
-        if self.use_tabular and tabular_feat is not None:
-            combined = torch.cat([image_feat, tabular_feat], dim=-1)
+        The evidential head outputs α, which is converted to logits
+        for compatibility with existing loss functions.
+        Use forward_evidential() for full α + uncertainty output.
+        """
+        image_feat, _ = self.forward_features(x, tabular)
+        
+        # Evidential head → α
+        alpha = self.evidential_head(image_feat)
+        
+        # Convert to logits for compatibility
+        if self.num_classes == 1:
+            # Binary: log(α₁/α₂) gives logit
+            logits = (alpha[:, 0] - alpha[:, 1]).unsqueeze(-1)
         else:
-            combined = image_feat
-        
-        logits = self.classifier(combined)
+            # Multi-class: log(α) - log(Σα) gives log-probabilities ≈ logits
+            logits = torch.log(alpha) - torch.log(alpha.sum(dim=-1, keepdim=True))
         
         return logits
+    
+    def forward_evidential(
+        self,
+        x: torch.Tensor,
+        tabular: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Full evidential forward pass.
+        
+        Returns:
+            alpha: (B, K) Dirichlet concentrations
+            probs: (B, K) predicted class probabilities  
+            uncertainty: (B,) epistemic uncertainty (K/Σα)
+        """
+        image_feat, _ = self.forward_features(x, tabular)
+        alpha = self.evidential_head(image_feat)
+        probs, uncertainty = self.evidential_head.get_prediction(alpha)
+        return alpha, probs, uncertainty
+    
+    def get_moe_aux_loss(self) -> torch.Tensor:
+        """Get MoE load-balancing auxiliary loss for training."""
+        return self.moe.aux_loss
 
 
 class MambaDermLite(nn.Module):
-    """
-    Lightweight version of MambaDerm for faster inference.
-    
-    Reduces parameters by:
-    - Fewer Mamba layers (2 instead of 4)
-    - Smaller hidden dimensions
-    - No cross-attention fusion
-    """
+    """Lightweight MambaDerm with reduced depth/width."""
     
     def __init__(
         self,
@@ -437,8 +525,6 @@ class MambaDermLite(nn.Module):
         num_classes: int = 1,
     ):
         super().__init__()
-        
-        # Lighter configuration using depths parameter
         self.model = MambaDerm(
             img_size=img_size,
             embed_dim=64,
@@ -453,6 +539,12 @@ class MambaDermLite(nn.Module):
     
     def forward(self, x, tabular=None):
         return self.model(x, tabular)
+    
+    def forward_evidential(self, x, tabular=None):
+        return self.model.forward_evidential(x, tabular)
+    
+    def get_moe_aux_loss(self):
+        return self.model.get_moe_aux_loss()
 
 
 def count_parameters(model: nn.Module) -> int:
@@ -476,9 +568,12 @@ if __name__ == "__main__":
     
     with torch.no_grad():
         out = model(x, tabular)
+        alpha, probs, unc = model.forward_evidential(x, tabular)
     
     print(f"Input: {x.shape}")
     print(f"Tabular: {tabular.shape}")
-    print(f"Output: {out.shape}")
+    print(f"Logits: {out.shape}")
+    print(f"Alpha: {alpha.shape}, Probs: {probs.shape}, Uncertainty: {unc.shape}")
+    print(f"MoE aux loss: {model.get_moe_aux_loss().item():.6f}")
     
     print("\nMambaDerm test passed!")

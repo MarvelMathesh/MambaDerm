@@ -1,18 +1,18 @@
 """
-HAM10000 Training Script (Golden Pipeline)
+HAM10000 Training Script
 
 7-class skin cancer classification with:
 - Multi-class Focal Loss with class weighting
-- CutMix augmentation (clinically appropriate)
-- Progressive oversampling for minority classes
-- Stochastic depth (drop_path) + gated bidirectional fusion
+- CutMix augmentation
+- EMA model averaging
+- MoE auxiliary loss
 - Layer-wise learning rate decay
 - Early stopping with patience
 - Balanced accuracy & Macro F1 evaluation
-- Optional W&B logging
 """
 
 import argparse
+import copy
 import random
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -183,6 +183,8 @@ def get_args():
     # Loss
     parser.add_argument('--focal_gamma', type=float, default=2.0)
     parser.add_argument('--label_smoothing', type=float, default=0.1)
+    parser.add_argument('--moe_aux_weight', type=float, default=0.01)
+    parser.add_argument('--ema_decay', type=float, default=0.9999)
     
     # Early stopping
     parser.add_argument('--early_stopping', action='store_true', default=True)
@@ -297,8 +299,9 @@ def train_epoch(
     args,
     epoch: int,
     cutmix_fn: Optional[CutMixMultiClass] = None,
+    ema=None,
 ) -> Dict[str, float]:
-    """Train for one epoch with CutMix."""
+    """Train for one epoch with CutMix and MoE aux loss."""
     model.train()
     
     total_loss = 0.0
@@ -324,11 +327,13 @@ def train_epoch(
             outputs = model(images, tabular)
             
             if use_soft_labels:
-                # Unified: use soft cross-entropy when CutMix was applied
                 loss = soft_cross_entropy(outputs, soft_labels)
             else:
-                # Use configured criterion for hard labels
                 loss = criterion(outputs, labels)
+            
+            # MoE auxiliary loss
+            if hasattr(model, 'get_moe_aux_loss'):
+                loss = loss + args.moe_aux_weight * model.get_moe_aux_loss()
             
             loss = loss / args.accumulation_steps
         
@@ -345,6 +350,8 @@ def train_epoch(
                 scaler.update()
                 if scheduler is not None:
                     scheduler.step()
+                if ema is not None:
+                    ema.update(model)
             else:
                 scaler.update()
             
@@ -435,6 +442,10 @@ def save_checkpoint(
                     for k, v in metrics.items()},
     }
     
+    # Include EMA if available
+    if hasattr(model, '_ema_state'):
+        checkpoint['ema_state_dict'] = model._ema_state
+    
     # Save latest
     torch.save(checkpoint, checkpoint_dir / "latest.pt")
     
@@ -504,6 +515,13 @@ def main():
     # Mixed precision
     scaler = GradScaler('cuda', enabled=args.use_amp)
     
+    # EMA
+    ema = None
+    if args.ema_decay > 0:
+        from train import ModelEMA
+        ema = ModelEMA(model, decay=args.ema_decay)
+        print(f"EMA enabled (decay={args.ema_decay})")
+    
     # CutMix
     cutmix_fn = None
     if args.use_cutmix:
@@ -540,12 +558,13 @@ def main():
         # Train
         train_metrics = train_epoch(
             model, train_loader, optimizer, criterion,
-            scaler, scheduler, device, args, epoch, cutmix_fn
+            scaler, scheduler, device, args, epoch, cutmix_fn, ema
         )
         
-        # Validate
+        # Validate (use EMA model if available)
+        eval_model = ema.ema_model if ema is not None else model
         val_metrics = validate(
-            model, val_loader, criterion, device, args, epoch
+            eval_model, val_loader, criterion, device, args, epoch
         )
         
         metrics = {**train_metrics, **val_metrics}

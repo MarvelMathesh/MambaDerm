@@ -1,26 +1,27 @@
 """
-Tabular Encoder Module
+Tabular Transformer Encoder
 
-Encodes clinical metadata (numerical and categorical features) 
-for fusion with image features.
+Per-feature tokenization with self-attention across clinical metadata features.
+Each numerical/categorical feature becomes a token; self-attention captures
+feature interactions (e.g., age × lesion-size, site × morphology).
+CLS token aggregation produces the final output.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional
+import math
 
 
 class TabularEncoder(nn.Module):
     """
-    Encodes tabular/clinical metadata for multimodal fusion.
+    Transformer-based tabular encoder with per-feature tokenization.
     
-    Processes numerical features with normalization and categorical 
-    features with embeddings, then projects to matching image feature dimension.
-    
-    Features based on ISIC 2024 metadata:
-    - Numerical: age, lesion measurements, color features (34 features)
-    - Categorical: sex, anatomical site, tile type, etc. (6 features)
+    Each feature (numerical or categorical) is projected into a d-dimensional
+    token. A learnable [CLS] token is prepended, and 2-layer self-attention
+    captures cross-feature interactions. The [CLS] output is the final
+    (B, output_dim) representation.
     """
     
     def __init__(
@@ -33,117 +34,133 @@ class TabularEncoder(nn.Module):
         output_dim: int = 192,
         dropout: float = 0.1,
         use_missingness_embedding: bool = True,
+        n_heads: int = 4,
+        n_layers: int = 2,
     ):
         super().__init__()
         
         self.num_numerical = num_numerical
         self.num_categorical = num_categorical
         self.use_missingness_embedding = use_missingness_embedding
+        self.output_dim = output_dim
         
-        # Default cardinalities for ISIC categorical features
+        # Token dimension = hidden_dim
+        token_dim = hidden_dim
+        
         if categorical_cardinalities is None:
-            # sex (3), anatom_site_general (7), tbp_tile_type (4), 
-            # tbp_lv_location (10), tbp_lv_location_simple (5), attribution (5)
             categorical_cardinalities = [3, 7, 4, 10, 5, 5]
-        
         self.categorical_cardinalities = categorical_cardinalities
         
-        # Learnable missingness embeddings for each numerical feature
+        # Learnable missingness fill values
         if use_missingness_embedding:
             self.missing_embed = nn.Parameter(torch.zeros(num_numerical))
             nn.init.normal_(self.missing_embed, std=0.02)
         
-        # Numerical feature processing (expanded for missingness indicator)
-        num_input_dim = num_numerical * 2 if use_missingness_embedding else num_numerical
+        # Per-feature numerical projections: each scalar → token_dim
+        # (with optional missingness indicator → 2 input dims per feature)
+        feat_input_dim = 2 if use_missingness_embedding else 1
+        self.num_tokenizers = nn.ModuleList([
+            nn.Linear(feat_input_dim, token_dim)
+            for _ in range(num_numerical)
+        ])
         self.num_norm = nn.BatchNorm1d(num_numerical)
-        self.num_proj = nn.Linear(num_input_dim, hidden_dim)
         
-        # Categorical embeddings
+        # Categorical embeddings → token_dim each
         self.cat_embeddings = nn.ModuleList([
-            nn.Embedding(card + 1, embedding_dim, padding_idx=0)  # +1 for unknown/padding
+            nn.Embedding(card + 1, token_dim, padding_idx=0)
             for card in categorical_cardinalities
         ])
         
-        # Total categorical dimension
-        total_cat_dim = num_categorical * embedding_dim
-        self.cat_proj = nn.Linear(total_cat_dim, hidden_dim)
+        # [CLS] token
+        total_tokens = num_numerical + num_categorical + 1  # +1 for CLS
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, token_dim))
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
         
-        # Combined MLP
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim * 2),
-            nn.LayerNorm(hidden_dim * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, output_dim),
+        # Learnable positional embedding for all tokens
+        self.pos_embed = nn.Parameter(torch.zeros(1, total_tokens, token_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=token_dim,
+            nhead=n_heads,
+            dim_feedforward=token_dim * 4,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        
+        # Output projection from CLS token
+        self.out_proj = nn.Sequential(
+            nn.LayerNorm(token_dim),
+            nn.Linear(token_dim, output_dim),
             nn.LayerNorm(output_dim),
         )
-        
-        self.output_dim = output_dim
     
     def forward(
-        self, 
-        numerical: torch.Tensor, 
+        self,
+        numerical: torch.Tensor,
         categorical: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Args:
-            numerical: Numerical features of shape (B, num_numerical)
-            categorical: Categorical features of shape (B, num_categorical), 
-                        as integer indices
-            
+            numerical: (B, num_numerical)
+            categorical: (B, num_categorical) integer indices
         Returns:
-            Encoded features of shape (B, output_dim)
+            (B, output_dim)
         """
-        batch_size = numerical.shape[0]
+        B = numerical.shape[0]
+        tokens = []
         
-        # Process numerical features with missingness encoding
-        # Create missingness mask before replacing NaN
+        # Handle missing values
         if self.use_missingness_embedding:
-            is_missing = torch.isnan(numerical).float()  # (B, num_numerical)
-            # Replace NaN with learned embedding values
+            is_missing = torch.isnan(numerical).float()
             numerical = torch.where(
                 torch.isnan(numerical),
-                self.missing_embed.unsqueeze(0).expand(batch_size, -1),
+                self.missing_embed.unsqueeze(0).expand(B, -1),
                 numerical
             )
         else:
-            numerical = torch.nan_to_num(numerical, nan=0.0)
             is_missing = None
+            numerical = torch.nan_to_num(numerical, nan=0.0)
         
-        # Apply normalization to the (NaN-free) numerical features
+        # Normalize numerical features
         num_normed = self.num_norm(numerical)
         
-        # Concatenate missingness indicator if enabled
-        if self.use_missingness_embedding and is_missing is not None:
-            num_feat = torch.cat([num_normed, is_missing], dim=-1)
-        else:
-            num_feat = num_normed
+        # Tokenize each numerical feature independently
+        for i, tokenizer in enumerate(self.num_tokenizers):
+            val = num_normed[:, i:i+1]  # (B, 1)
+            if self.use_missingness_embedding and is_missing is not None:
+                val = torch.cat([val, is_missing[:, i:i+1]], dim=-1)  # (B, 2)
+            tok = tokenizer(val)  # (B, token_dim)
+            tokens.append(tok.unsqueeze(1))  # (B, 1, token_dim)
         
-        num_feat = self.num_proj(num_feat)  # (B, hidden_dim)
-        num_feat = F.gelu(num_feat)
-        
-        # Process categorical features
+        # Tokenize categorical features
         if categorical is not None and self.num_categorical > 0:
-            cat_embeds = []
             for i, embed_layer in enumerate(self.cat_embeddings):
-                cat_idx = categorical[:, i].long()
-                # Clamp to valid range
-                cat_idx = cat_idx.clamp(0, self.categorical_cardinalities[i])
-                cat_embeds.append(embed_layer(cat_idx))
-            
-            cat_feat = torch.cat(cat_embeds, dim=-1)  # (B, num_cat * embed_dim)
-            cat_feat = self.cat_proj(cat_feat)  # (B, hidden_dim)
-            cat_feat = F.gelu(cat_feat)
+                cat_idx = categorical[:, i].long().clamp(0, self.categorical_cardinalities[i])
+                tok = embed_layer(cat_idx)  # (B, token_dim)
+                tokens.append(tok.unsqueeze(1))
         else:
-            # If no categorical, use zeros
-            cat_feat = torch.zeros(batch_size, self.mlp[0].in_features // 2, 
-                                   device=numerical.device, dtype=numerical.dtype)
+            # Pad with zeros for missing categorical
+            for _ in range(self.num_categorical):
+                tokens.append(torch.zeros(B, 1, tokens[0].shape[-1],
+                                         device=numerical.device, dtype=numerical.dtype))
         
-        # Combine and project
-        combined = torch.cat([num_feat, cat_feat], dim=-1)  # (B, hidden_dim * 2)
-        output = self.mlp(combined)  # (B, output_dim)
+        # Prepend CLS token
+        cls = self.cls_token.expand(B, -1, -1)
+        tokens = [cls] + tokens
         
-        return output
-
-
-
+        # Stack all tokens: (B, 1+num_numerical+num_categorical, token_dim)
+        x = torch.cat(tokens, dim=1)
+        x = x + self.pos_embed
+        
+        # Self-attention across features
+        x = self.transformer(x)
+        
+        # Extract CLS token
+        cls_out = x[:, 0]  # (B, token_dim)
+        
+        return self.out_proj(cls_out)  # (B, output_dim)

@@ -17,6 +17,10 @@ from .losses import (
     MultiClassFocalLoss,
     LabelSmoothingCrossEntropy,
     MultiClassMultiObjectiveLoss,
+    EvidentialLoss,
+    AUCMarginLoss,
+    LearnableWeightedLoss,
+    EvidentialMultiObjectiveLoss,
 )
 from .scheduler import get_cosine_schedule_with_warmup
 from .tta import TTAWrapper, TTAInference, get_tta_predictions
@@ -26,6 +30,8 @@ from .uncertainty import (
     OODDetector,
     SafePredictor,
     compute_ece,
+    EvidentialUncertainty,
+    ConformalPredictor,
 )
 from .export import (
     export_torchscript,
@@ -50,6 +56,11 @@ __all__ = [
     "LabelSmoothingBCE",
     "AUCMaxLoss",
     "MultiObjectiveLoss",
+    # Losses (binary — new)
+    "EvidentialLoss",
+    "AUCMarginLoss",
+    "LearnableWeightedLoss",
+    "EvidentialMultiObjectiveLoss",
     # Losses (multi-class)
     "MultiClassFocalLoss",
     "LabelSmoothingCrossEntropy",
@@ -66,6 +77,8 @@ __all__ = [
     "OODDetector",
     "SafePredictor",
     "compute_ece",
+    "EvidentialUncertainty",
+    "ConformalPredictor",
     # Export
     "export_torchscript",
     "export_onnx",

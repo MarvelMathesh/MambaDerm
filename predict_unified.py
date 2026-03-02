@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from models import MambaDerm
 from data.transforms import get_val_transforms, get_tta_transforms
 from data.ham10000_dataset import HAM10000_CLASSES, HAM10000_CLASS_NAMES
+from utils.uncertainty import EvidentialUncertainty
 
 
 # HAM10000 class → Malignancy mapping
@@ -159,7 +160,11 @@ class UnifiedClinicalPredictor:
         )
         
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-        if 'model_state_dict' in checkpoint:
+        # Prefer EMA weights if available
+        if 'ema_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['ema_state_dict'])
+            print(f"  ✓ Loaded EMA weights from {checkpoint_path}")
+        elif 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
         else:
             model.load_state_dict(checkpoint)
@@ -193,7 +198,10 @@ class UnifiedClinicalPredictor:
         )
         
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-        if 'model_state_dict' in checkpoint:
+        if 'ema_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['ema_state_dict'])
+            print(f"  ✓ Loaded EMA weights from {checkpoint_path}")
+        elif 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
         else:
             model.load_state_dict(checkpoint)
@@ -223,13 +231,14 @@ class UnifiedClinicalPredictor:
         return torch.zeros(1, 19)
     
     @torch.no_grad()
-    def _predict_isic(self, image_np: np.ndarray) -> float:
-        """Get malignancy probability from ISIC model."""
+    def _predict_isic(self, image_np: np.ndarray) -> dict:
+        """Get malignancy probability and uncertainty from ISIC model."""
         if self.isic_model is None:
             return None
         
         if self.use_tta:
             all_probs = []
+            all_unc = []
             for transform in self.tta_transform_list[:self.tta_transforms]:
                 transformed = transform(image=image_np)
                 img = transformed['image'].unsqueeze(0).to(self.device)
@@ -237,12 +246,29 @@ class UnifiedClinicalPredictor:
                 logits = self.isic_model(img, tabular)
                 prob = torch.sigmoid(logits).item()
                 all_probs.append(prob)
-            return np.mean(all_probs)
+                
+                # Evidential uncertainty
+                if hasattr(self.isic_model, 'forward_evidential'):
+                    alpha, _, unc = self.isic_model.forward_evidential(img, tabular)
+                    all_unc.append(unc.item())
+            
+            return {
+                'prob': np.mean(all_probs),
+                'uncertainty': np.mean(all_unc) if all_unc else None,
+                'tta_std': np.std(all_probs),
+            }
         else:
             img = self._preprocess_image(image_np).unsqueeze(0).to(self.device)
             tabular = self._get_isic_tabular().to(self.device)
             logits = self.isic_model(img, tabular)
-            return torch.sigmoid(logits).item()
+            prob = torch.sigmoid(logits).item()
+            
+            unc = None
+            if hasattr(self.isic_model, 'forward_evidential'):
+                alpha, _, u = self.isic_model.forward_evidential(img, tabular)
+                unc = u.item()
+            
+            return {'prob': prob, 'uncertainty': unc, 'tta_std': 0.0}
     
     @torch.no_grad()
     def _predict_ham(self, image_np: np.ndarray) -> np.ndarray:
@@ -302,8 +328,12 @@ class UnifiedClinicalPredictor:
             image_np = image
         
         # Get predictions from both models
-        isic_prob = self._predict_isic(image_np)
+        isic_result = self._predict_isic(image_np)
         ham_probs = self._predict_ham(image_np)
+        
+        isic_prob = isic_result['prob'] if isic_result is not None else None
+        isic_uncertainty = isic_result.get('uncertainty') if isic_result else None
+        isic_tta_std = isic_result.get('tta_std', 0.0) if isic_result else 0.0
         
         # Compute HAM-derived malignancy
         ham_malignancy = self._compute_ham_malignancy(ham_probs) if ham_probs is not None else None
@@ -355,6 +385,8 @@ class UnifiedClinicalPredictor:
             'isic_model': {
                 'malignancy': float(isic_prob) if isic_prob else None,
                 'available': isic_prob is not None,
+                'evidential_uncertainty': float(isic_uncertainty) if isic_uncertainty is not None else None,
+                'tta_std': float(isic_tta_std),
             },
             'ham_model': {
                 'malignancy_derived': float(ham_malignancy) if ham_malignancy else None,

@@ -211,13 +211,147 @@ class SelectiveSSM(nn.Module):
         return y
 
 
+class FrequencyBranch(nn.Module):
+    """
+    Frequency-domain feature extraction via 2D DCT.
+    
+    Dermoscopic textures (pigment networks, blue-white veil, dermatoglyphics)
+    have distinctive frequency signatures that spatial-only models miss.
+    
+    Applies 2D DCT, learnable channel-wise frequency selection, then inverse DCT.
+    """
+    
+    def __init__(self, d_model: int, reduction: int = 4):
+        super().__init__()
+        self.d_model = d_model
+        # Learnable frequency selector: which frequency bands matter
+        self.freq_gate = nn.Sequential(
+            nn.Linear(d_model, d_model // reduction),
+            nn.GELU(),
+            nn.Linear(d_model // reduction, d_model),
+            nn.Sigmoid(),
+        )
+        self.norm = nn.LayerNorm(d_model)
+    
+    def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        """
+        Args:
+            x: (B, H*W, D) spatial features
+            H, W: spatial dimensions
+        Returns:
+            (B, H*W, D) frequency-enhanced features
+        """
+        B, L, D = x.shape
+        # Reshape to spatial grid
+        x_2d = x.reshape(B, H, W, D).permute(0, 3, 1, 2).float()  # B,D,H,W
+        
+        # 2D DCT via real FFT (efficient approximation)
+        freq = torch.fft.rfft2(x_2d, norm='ortho')
+        freq_mag = freq.abs()  # B,D,H,W//2+1
+        
+        # Channel-wise frequency importance (pool spatial freq dims)
+        freq_pool = freq_mag.mean(dim=(-2, -1))  # B,D
+        gate = self.freq_gate(freq_pool)  # B,D
+        
+        # Apply frequency selection per channel
+        freq_filtered = freq * gate[:, :, None, None]
+        
+        # Inverse FFT back to spatial domain
+        x_filtered = torch.fft.irfft2(freq_filtered, s=(H, W), norm='ortho')
+        x_filtered = x_filtered.permute(0, 2, 3, 1).reshape(B, L, D)  # B,L,D
+        
+        return self.norm(x_filtered)
+
+
+def _create_ssm(d_model, d_state, d_conv, expand, dropout=0.0):
+    """Factory to create a single SSM (Mamba or fallback)."""
+    if MAMBA_AVAILABLE:
+        return Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+    else:
+        return SelectiveSSM(
+            d_model=d_model, d_state=d_state, d_conv=d_conv,
+            expand=expand, dropout=dropout,
+        )
+
+
+class CrossScanSSM(nn.Module):
+    """
+    4-directional Cross-Scan Selective State Space Model.
+    
+    Scans the 2D feature map in 4 directions:
+      1. Row-forward  (left→right, top→bottom)
+      2. Row-backward (right→left, bottom→top)
+      3. Column-forward  (top→bottom, left→right flattened by columns)
+      4. Column-backward (bottom→top, right→left flattened by columns)
+    
+    Each direction uses an independent Mamba instance for directional
+    specialization. Outputs are merged via learned weighted combination.
+    
+    Reference: VMamba cross-scan, adapted with per-direction independence.
+    """
+    
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        
+        # 4 independent SSM instances for directional specialization
+        self.ssm_row_fwd = _create_ssm(d_model, d_state, d_conv, expand, dropout)
+        self.ssm_row_bwd = _create_ssm(d_model, d_state, d_conv, expand, dropout)
+        self.ssm_col_fwd = _create_ssm(d_model, d_state, d_conv, expand, dropout)
+        self.ssm_col_bwd = _create_ssm(d_model, d_state, d_conv, expand, dropout)
+        
+        # Learned weighted fusion (not a simple gate — per-direction weights)
+        self.merge_weights = nn.Parameter(torch.ones(4) * 0.25)
+        self.merge_norm = nn.LayerNorm(d_model)
+    
+    def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        """
+        Args:
+            x: (B, H*W, D) flattened spatial features
+            H, W: spatial dimensions
+        Returns:
+            (B, H*W, D) cross-scanned features
+        """
+        B, L, D = x.shape
+        
+        # Direction 1: Row-forward (standard raster scan)
+        y_row_fwd = self.ssm_row_fwd(x)
+        
+        # Direction 2: Row-backward (reverse raster)
+        y_row_bwd = self.ssm_row_bwd(torch.flip(x, [1]))
+        y_row_bwd = torch.flip(y_row_bwd, [1])
+        
+        # Direction 3: Column-forward (transpose scan order)
+        x_2d = x.reshape(B, H, W, D)
+        x_col = x_2d.permute(0, 2, 1, 3).reshape(B, L, D)  # W,H order
+        y_col_fwd = self.ssm_col_fwd(x_col)
+        y_col_fwd = y_col_fwd.reshape(B, W, H, D).permute(0, 2, 1, 3).reshape(B, L, D)
+        
+        # Direction 4: Column-backward (reverse transpose)
+        y_col_bwd = self.ssm_col_bwd(torch.flip(x_col, [1]))
+        y_col_bwd = torch.flip(y_col_bwd, [1])
+        y_col_bwd = y_col_bwd.reshape(B, W, H, D).permute(0, 2, 1, 3).reshape(B, L, D)
+        
+        # Weighted fusion with softmax-normalized weights
+        w = F.softmax(self.merge_weights, dim=0)
+        y = w[0] * y_row_fwd + w[1] * y_row_bwd + w[2] * y_col_fwd + w[3] * y_col_bwd
+        
+        return self.merge_norm(y)
+
+
 class VisionMambaBlock(nn.Module):
     """
-    Vision Mamba block with bidirectional scanning.
+    Vision Mamba block with 4-directional cross-scan.
     
-    Combines forward and backward SSM passes for images,
-    following the VMamba paper approach. Uses gated fusion
-    for adaptive forward/backward balance.
+    Uses CrossScanSSM for spatially-aware scanning in all 4 directions
+    (row↔, col↔) with optional frequency-domain branch fusion.
     """
     
     def __init__(
@@ -228,54 +362,30 @@ class VisionMambaBlock(nn.Module):
         expand: int = 2,
         dropout: float = 0.0,
         drop_path: float = 0.0,
-        bidirectional: bool = True,
+        bidirectional: bool = True,  # kept for API compat; always uses cross-scan
+        use_freq_branch: bool = False,
     ):
         super().__init__()
         
         self.d_model = d_model
-        self.bidirectional = bidirectional
+        self.use_freq_branch = use_freq_branch
         
         # Layer norm
         self.norm = nn.LayerNorm(d_model)
         
-        # Forward SSM
-        if MAMBA_AVAILABLE:
-            self.ssm_forward = Mamba(
-                d_model=d_model,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand,
-            )
-        else:
-            self.ssm_forward = SelectiveSSM(
-                d_model=d_model,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand,
-                dropout=dropout,
-            )
+        # Cross-scan SSM (replaces bidirectional)
+        self.cross_scan = CrossScanSSM(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            dropout=dropout,
+        )
         
-        # Backward SSM (for bidirectional)
-        if bidirectional:
-            if MAMBA_AVAILABLE:
-                self.ssm_backward = Mamba(
-                    d_model=d_model,
-                    d_state=d_state,
-                    d_conv=d_conv,
-                    expand=expand,
-                )
-            else:
-                self.ssm_backward = SelectiveSSM(
-                    d_model=d_model,
-                    d_state=d_state,
-                    d_conv=d_conv,
-                    expand=expand,
-                    dropout=dropout,
-                )
-            
-            # Gated fusion for bidirectional outputs
-            # Adaptive control over forward vs backward contribution per-token
-            self.gate = nn.Sequential(
+        # Optional frequency branch with additive gating
+        if use_freq_branch:
+            self.freq_branch = FrequencyBranch(d_model)
+            self.freq_gate = nn.Sequential(
                 nn.Linear(d_model * 2, d_model),
                 nn.Sigmoid(),
             )
@@ -284,32 +394,30 @@ class VisionMambaBlock(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.dropout = nn.Dropout(dropout)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, H: int = 0, W: int = 0) -> torch.Tensor:
         """
         Args:
-            x: Input tensor of shape (B, L, D) - flattened image patches
+            x: Input tensor of shape (B, L, D)
+            H, W: spatial dimensions (inferred from L if 0)
             
         Returns:
             Output tensor of shape (B, L, D)
         """
+        B, L, D = x.shape
+        if H == 0 or W == 0:
+            H = W = int(math.sqrt(L))
+        
         residual = x
-        x = self.norm(x)
+        x_normed = self.norm(x)
         
-        # Forward pass
-        y_forward = self.ssm_forward(x)
+        # 4-directional cross-scan
+        y = self.cross_scan(x_normed, H, W)
         
-        if self.bidirectional:
-            # Backward pass (reverse sequence)
-            x_backward = torch.flip(x, dims=[1])
-            y_backward = self.ssm_backward(x_backward)
-            y_backward = torch.flip(y_backward, dims=[1])  # Flip back
-            
-            # Gated fusion of forward and backward
-            combined = torch.cat([y_forward, y_backward], dim=-1)
-            gate = self.gate(combined)
-            y = gate * y_forward + (1 - gate) * y_backward
-        else:
-            y = y_forward
+        # Frequency branch fusion (if enabled)
+        if self.use_freq_branch:
+            freq_feat = self.freq_branch(x_normed, H, W)
+            gate = self.freq_gate(torch.cat([y, freq_feat], dim=-1))
+            y = y + gate * freq_feat
         
         # Residual connection with stochastic depth
         y = self.drop_path(self.dropout(y)) + residual
@@ -319,10 +427,7 @@ class VisionMambaBlock(nn.Module):
 
 class VMambaLayer(nn.Module):
     """
-    Complete VMamba layer with SSM block and MLP.
-    
-    Similar to Transformer layer structure:
-    x -> SSM Block -> MLP -> output
+    Complete VMamba layer: CrossScan SSM block + MLP.
     
     Supports stochastic depth (drop path) for regularization.
     """
@@ -337,10 +442,11 @@ class VMambaLayer(nn.Module):
         dropout: float = 0.0,
         drop_path: float = 0.0,
         bidirectional: bool = True,
+        use_freq_branch: bool = False,
     ):
         super().__init__()
         
-        # SSM Block (drop_path applied inside VisionMambaBlock)
+        # SSM Block with cross-scan
         self.ssm_block = VisionMambaBlock(
             d_model=d_model,
             d_state=d_state,
@@ -349,6 +455,7 @@ class VMambaLayer(nn.Module):
             dropout=dropout,
             drop_path=drop_path,
             bidirectional=bidirectional,
+            use_freq_branch=use_freq_branch,
         )
         
         # MLP Block
@@ -365,16 +472,17 @@ class VMambaLayer(nn.Module):
         # Drop path for MLP branch
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, H: int = 0, W: int = 0) -> torch.Tensor:
         """
         Args:
             x: Input tensor of shape (B, L, D)
+            H, W: spatial dimensions (passed through to SSM block)
             
         Returns:
             Output tensor of shape (B, L, D)
         """
         # SSM block (residual + drop_path handled inside VisionMambaBlock)
-        x = self.ssm_block(x)
+        x = self.ssm_block(x, H, W)
         
         # MLP block with residual + stochastic depth
         x = x + self.drop_path(self.mlp(self.mlp_norm(x)))

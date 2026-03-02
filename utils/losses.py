@@ -495,3 +495,248 @@ class MultiClassMultiObjectiveLoss(nn.Module):
         smooth_loss = self.smooth(inputs, targets)
         
         return self.focal_weight * focal_loss + self.smooth_weight * smooth_loss
+
+
+class EvidentialLoss(nn.Module):
+    """
+    Evidential Deep Learning loss for Dirichlet-based uncertainty.
+    
+    Type-II Maximum Likelihood + KL divergence regularizer.
+    Given α = Dirichlet concentrations from the model:
+        S = Σα_k (Dirichlet strength)
+        p_k = α_k / S (expected class probabilities)
+    
+    Loss = Σ_k y_k * (ψ(S) - ψ(α_k))  +  λ * KL(Dir(α̃) || Dir(1))
+    
+    where α̃ = y + (1-y) ⊙ α  (remove evidence for correct class before KL).
+    
+    Args:
+        num_classes: Number of classes (K ≥ 2)
+        kl_weight: Weight for KL regularizer (annealed during training)
+        reduction: 'mean' or 'sum'
+    """
+    
+    def __init__(
+        self,
+        num_classes: int = 2,
+        kl_weight: float = 0.1,
+        reduction: str = 'mean',
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.kl_weight = kl_weight
+        self.reduction = reduction
+    
+    def _kl_divergence(self, alpha: torch.Tensor) -> torch.Tensor:
+        """KL(Dir(α) || Dir(1))"""
+        K = alpha.shape[-1]
+        ones = torch.ones_like(alpha)
+        
+        S_alpha = alpha.sum(dim=-1, keepdim=True)
+        S_ones = ones.sum(dim=-1, keepdim=True)
+        
+        kl = (
+            torch.lgamma(S_alpha) - torch.lgamma(S_ones)
+            - (torch.lgamma(alpha) - torch.lgamma(ones)).sum(dim=-1, keepdim=True)
+            + ((alpha - ones) * (torch.digamma(alpha) - torch.digamma(S_alpha))).sum(
+                dim=-1, keepdim=True
+            )
+        )
+        return kl.squeeze(-1)
+    
+    def forward(
+        self,
+        alpha: torch.Tensor,
+        targets: torch.Tensor,
+        kl_anneal: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        Args:
+            alpha: (B, K) Dirichlet concentration parameters (α ≥ 1)
+            targets: (B,) class indices for multi-class, or (B,) binary {0,1}
+            kl_anneal: Annealing factor for KL term (0→1 over training)
+        
+        Returns:
+            Scalar loss
+        """
+        K = self.num_classes
+        
+        # Convert targets to one-hot
+        if targets.dim() == 1:
+            if K == 2 and targets.max() <= 1:
+                # Binary: convert scalar target to 2-class one-hot
+                y = F.one_hot(targets.long(), num_classes=K).float()
+            else:
+                y = F.one_hot(targets.long(), num_classes=K).float()
+        else:
+            y = targets.float()
+        
+        S = alpha.sum(dim=-1, keepdim=True)  # (B, 1)
+        
+        # Type-II ML: Σ y_k * (ψ(S) - ψ(α_k))
+        ml_loss = (y * (torch.digamma(S) - torch.digamma(alpha))).sum(dim=-1)
+        
+        # KL regularizer: remove evidence for correct class
+        alpha_tilde = y + (1 - y) * alpha
+        kl_loss = self._kl_divergence(alpha_tilde)
+        
+        loss = ml_loss + self.kl_weight * kl_anneal * kl_loss
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        return loss
+
+
+class AUCMarginLoss(nn.Module):
+    """
+    Square-hinge AUC margin loss for direct pAUC optimization.
+    
+    For each (pos, neg) pair:
+        loss = max(0, margin - (s_pos - s_neg))²
+    
+    The squared hinge provides smoother gradients than standard hinge,
+    and the margin encourages separation aligned with TPR@80% threshold.
+    
+    Args:
+        margin: Desired score margin between pos/neg (default: 1.0)
+        reduction: 'mean' or 'sum'
+    """
+    
+    def __init__(self, margin: float = 1.0, reduction: str = 'mean'):
+        super().__init__()
+        self.margin = margin
+        self.reduction = reduction
+    
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        hard_targets: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            inputs: (N,) or (N,1) logits/scores
+            targets: (N,) soft targets (ignored if hard_targets provided)
+            hard_targets: (N,) original binary targets for MixUp compat
+        """
+        inputs = inputs.view(-1)
+        sep = hard_targets.view(-1) if hard_targets is not None else targets.view(-1)
+        
+        pos_mask = sep > 0.5
+        neg_mask = sep < 0.5
+        
+        pos_scores = inputs[pos_mask]
+        neg_scores = inputs[neg_mask]
+        
+        if len(pos_scores) == 0 or len(neg_scores) == 0:
+            return torch.tensor(0.0, device=inputs.device, requires_grad=True)
+        
+        # Pairwise margin: (n_pos, n_neg)
+        diff = pos_scores.unsqueeze(1) - neg_scores.unsqueeze(0)
+        
+        # Squared hinge
+        loss = F.relu(self.margin - diff) ** 2
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        return loss.sum()
+
+
+class LearnableWeightedLoss(nn.Module):
+    """
+    Learnable multi-task loss weighting via homoscedastic uncertainty.
+    
+    Each loss component has a learnable log-variance σ². The total loss is:
+        L = Σ (1/(2σ²_i)) * L_i + log(σ²_i)
+    
+    This automatically balances loss magnitudes during training.
+    
+    Args:
+        num_losses: Number of loss components to weight
+    """
+    
+    def __init__(self, num_losses: int = 3):
+        super().__init__()
+        # Initialize log-variances to 0 (σ²=1, weight=0.5)
+        self.log_vars = nn.Parameter(torch.zeros(num_losses))
+    
+    def forward(self, *losses: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            *losses: Variable number of scalar loss tensors
+        Returns:
+            Weighted combined loss
+        """
+        total = torch.tensor(0.0, device=losses[0].device)
+        for i, loss in enumerate(losses):
+            precision = torch.exp(-self.log_vars[i])
+            total = total + precision * loss + self.log_vars[i]
+        return total
+    
+    def get_weights(self) -> torch.Tensor:
+        """Return current effective weights (1/(2σ²)) for logging."""
+        return torch.exp(-self.log_vars).detach()
+
+
+class EvidentialMultiObjectiveLoss(nn.Module):
+    """
+    Full training loss combining Evidential + Focal + AUC margin losses
+    with learnable weighting.
+    
+    Components:
+    1. EvidentialLoss: Type-II ML + KL reg on Dirichlet α
+    2. FocalLoss: On logits converted from α (class imbalance)
+    3. AUCMarginLoss: Square-hinge pairwise ranking (pAUC alignment)
+    
+    Plus: MoE auxiliary load-balancing loss added externally.
+    """
+    
+    def __init__(
+        self,
+        num_classes: int = 1,
+        focal_alpha: float = 0.75,
+        focal_gamma: float = 2.0,
+        auc_margin: float = 1.0,
+        kl_weight: float = 0.1,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        
+        K = max(num_classes, 2)
+        self.evidential = EvidentialLoss(num_classes=K, kl_weight=kl_weight)
+        self.focal = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+        self.auc_margin = AUCMarginLoss(margin=auc_margin)
+        self.weighting = LearnableWeightedLoss(num_losses=3)
+    
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        alpha: torch.Tensor = None,
+        hard_targets: torch.Tensor = None,
+        kl_anneal: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        Args:
+            logits: (B, 1) or (B, C) model output logits
+            targets: (B,) targets (may be soft from MixUp)
+            alpha: (B, K) Dirichlet concentrations (if available)
+            hard_targets: (B,) original binary targets for AUC loss
+            kl_anneal: KL annealing factor (ramp 0→1 over epochs)
+        """
+        # Focal loss on logits
+        focal_loss = self.focal(logits, targets)
+        
+        # AUC margin loss
+        auc_loss = self.auc_margin(logits, targets, hard_targets=hard_targets)
+        
+        # Evidential loss (if α provided)
+        if alpha is not None:
+            ev_targets = hard_targets if hard_targets is not None else targets
+            ev_loss = self.evidential(alpha, ev_targets, kl_anneal=kl_anneal)
+        else:
+            ev_loss = torch.tensor(0.0, device=logits.device)
+        
+        return self.weighting(focal_loss, auc_loss, ev_loss)

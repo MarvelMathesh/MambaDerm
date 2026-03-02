@@ -2,17 +2,17 @@
 MambaDerm Training Script
 
 Training infrastructure with:
-- Early stopping with patience
-- MixUp/CutMix augmentation with hard-target routing for AUCMaxLoss
-- Multi-objective loss (Focal + AUC + Label Smoothing)
+- EMA (Exponential Moving Average) model
+- Evidential loss with KL annealing + MoE auxiliary loss
+- MixUp/CutMix augmentation with hard-target routing
+- Learnable multi-task loss weighting
 - Learning rate warmup + cosine decay with layer-wise LR
 - Gradient checkpointing support
 - Weights & Biases logging
-- HDF5-safe multi-worker data loading
-- Proper logging and checkpointing
 """
 
 import argparse
+import copy
 import os
 import random
 import time
@@ -36,7 +36,38 @@ from data.dataset import hdf5_worker_init_fn
 from data.sampler import BalancedSampler
 from data.augmentations import MixUpCutMix, get_mixup_cutmix
 from utils import compute_pauc, pAUCMetric, get_cosine_schedule_with_warmup
-from utils.losses import MultiObjectiveLoss, FocalLoss
+from utils.losses import (
+    EvidentialMultiObjectiveLoss, MultiObjectiveLoss, FocalLoss,
+)
+
+
+class ModelEMA:
+    """
+    Exponential Moving Average of model parameters.
+    
+    Maintains a shadow copy of model weights updated as:
+        θ_ema = decay * θ_ema + (1 - decay) * θ_model
+    
+    The EMA model typically generalizes better than the final trained model.
+    """
+    
+    def __init__(self, model: nn.Module, decay: float = 0.9999):
+        self.decay = decay
+        self.ema_model = copy.deepcopy(model)
+        self.ema_model.eval()
+        for p in self.ema_model.parameters():
+            p.requires_grad_(False)
+    
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        for ema_p, model_p in zip(self.ema_model.parameters(), model.parameters()):
+            ema_p.data.mul_(self.decay).add_(model_p.data, alpha=1.0 - self.decay)
+    
+    def state_dict(self):
+        return self.ema_model.state_dict()
+    
+    def load_state_dict(self, state_dict):
+        self.ema_model.load_state_dict(state_dict)
 
 
 def set_seed(seed: int):
@@ -138,8 +169,12 @@ def get_args():
     parser.add_argument('--mixup_prob', type=float, default=0.5)
     
     # Loss
-    parser.add_argument('--loss_type', type=str, default='multi',
-                       choices=['focal', 'multi'])
+    parser.add_argument('--loss_type', type=str, default='evidential',
+                       choices=['focal', 'multi', 'evidential'])
+    parser.add_argument('--moe_aux_weight', type=float, default=0.01,
+                       help='Weight for MoE load-balancing auxiliary loss')
+    parser.add_argument('--ema_decay', type=float, default=0.9999,
+                       help='EMA decay rate (0 to disable)')
     
     # Sampling
     parser.add_argument('--neg_sampling_ratio', type=float, default=0.01)
@@ -251,12 +286,17 @@ def train_epoch(
     args,
     epoch: int,
     mixup_fn: Optional[MixUpCutMix] = None,
+    ema: Optional[ModelEMA] = None,
 ) -> Dict[str, float]:
-    """Train for one epoch with MixUp/CutMix and hard-target routing."""
+    """Train for one epoch with MixUp/CutMix, evidential loss, and MoE aux loss."""
     model.train()
     
     total_loss = 0.0
+    total_moe_loss = 0.0
     num_batches = 0
+    
+    # KL annealing: ramp from 0 to 1 over first half of training
+    kl_anneal = min(1.0, epoch / max(args.epochs * 0.5, 1))
     
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]")
     optimizer.zero_grad()
@@ -266,7 +306,7 @@ def train_epoch(
         tabular = tabular.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         
-        # Preserve hard targets for AUCMaxLoss before MixUp
+        # Preserve hard targets before MixUp
         hard_targets = targets.clone()
         
         # Apply MixUp/CutMix (produces soft targets)
@@ -276,11 +316,30 @@ def train_epoch(
         # Mixed precision forward
         with autocast('cuda', enabled=args.use_amp):
             outputs = model(images, tabular)
-            # Pass both soft and hard targets to loss
-            if hasattr(criterion, 'auc'):
+            
+            # Main loss (supports evidential, multi, or focal)
+            if isinstance(criterion, EvidentialMultiObjectiveLoss):
+                # Get alpha for evidential loss
+                alpha = None
+                if hasattr(model, 'forward_evidential'):
+                    alpha, _, _ = model.forward_evidential(images, tabular)
+                loss = criterion(
+                    outputs.squeeze(), targets,
+                    alpha=alpha,
+                    hard_targets=hard_targets,
+                    kl_anneal=kl_anneal,
+                )
+            elif hasattr(criterion, 'auc'):
                 loss = criterion(outputs.squeeze(), targets, hard_targets=hard_targets)
             else:
                 loss = criterion(outputs.squeeze(), targets)
+            
+            # MoE auxiliary load-balancing loss
+            moe_aux = torch.tensor(0.0, device=device)
+            if hasattr(model, 'get_moe_aux_loss'):
+                moe_aux = model.get_moe_aux_loss()
+                loss = loss + args.moe_aux_weight * moe_aux
+            
             loss = loss / args.accumulation_steps
         
         # Backward
@@ -296,23 +355,29 @@ def train_epoch(
                 scaler.update()
                 if scheduler is not None:
                     scheduler.step()
+                # EMA update
+                if ema is not None:
+                    ema.update(model)
             else:
                 scaler.update()
             
             optimizer.zero_grad()
         
         total_loss += loss.item() * args.accumulation_steps
+        total_moe_loss += moe_aux.item()
         num_batches += 1
         
         if batch_idx % args.log_interval == 0:
             current_lr = optimizer.param_groups[0]['lr']
             pbar.set_postfix({
                 'loss': f"{total_loss / num_batches:.4f}",
+                'moe': f"{total_moe_loss / num_batches:.4f}",
                 'lr': f"{current_lr:.2e}",
             })
     
     return {
         'train_loss': total_loss / num_batches,
+        'train_moe_loss': total_moe_loss / num_batches,
         'lr': optimizer.param_groups[0]['lr'],
     }
 
@@ -368,6 +433,7 @@ def save_checkpoint(
     metrics: Dict[str, float],
     checkpoint_dir: Path,
     is_best: bool = False,
+    ema: Optional[ModelEMA] = None,
 ):
     """Save model checkpoint."""
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -379,6 +445,8 @@ def save_checkpoint(
         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
         'metrics': metrics,
     }
+    if ema is not None:
+        checkpoint['ema_state_dict'] = ema.state_dict()
     
     # Save latest
     latest_path = checkpoint_dir / "latest.pt"
@@ -418,7 +486,19 @@ def main():
     model = model.to(device)
     
     # Loss
-    if args.loss_type == 'multi':
+    if args.loss_type == 'evidential':
+        criterion = EvidentialMultiObjectiveLoss(
+            num_classes=1,
+            focal_alpha=0.75,
+            focal_gamma=2.0,
+            auc_margin=1.0,
+            kl_weight=0.1,
+        )
+        # Move learnable loss weights to device
+        criterion = criterion.to(device)
+        print("Using EvidentialMultiObjectiveLoss (Evidential + Focal + AUC Margin)")
+        print("  Learnable loss weighting enabled")
+    elif args.loss_type == 'multi':
         criterion = MultiObjectiveLoss(
             focal_weight=0.5,
             auc_weight=0.3,
@@ -431,6 +511,17 @@ def main():
     
     # Optimizer with layer-wise learning rate decay
     param_groups = get_layer_wise_lr_groups(model, base_lr=args.lr, decay=args.lr_decay)
+    
+    # Add learnable loss parameters if present
+    loss_params = list(criterion.parameters()) if hasattr(criterion, 'parameters') else []
+    if loss_params:
+        param_groups.append({
+            'params': loss_params,
+            'lr': args.lr,
+            'weight_decay': 0.0,
+            'name': 'loss_weights',
+        })
+    
     optimizer = torch.optim.AdamW(
         param_groups,
         lr=args.lr,
@@ -438,6 +529,12 @@ def main():
     )
     for g in param_groups:
         print(f"  LR group '{g.get('name', '?')}': lr={g['lr']:.2e}, params={len(g['params'])}")
+    
+    # EMA model
+    ema = None
+    if args.ema_decay > 0:
+        ema = ModelEMA(model, decay=args.ema_decay)
+        print(f"EMA enabled (decay={args.ema_decay})")
     
     # Scheduler
     num_training_steps = len(train_loader) * args.epochs // args.accumulation_steps
@@ -496,12 +593,13 @@ def main():
         # Train
         train_metrics = train_epoch(
             model, train_loader, optimizer, criterion,
-            scaler, scheduler, device, args, epoch, mixup_fn
+            scaler, scheduler, device, args, epoch, mixup_fn, ema
         )
         
-        # Validate
+        # Validate (use EMA model if available)
+        eval_model = ema.ema_model if ema is not None else model
         val_metrics = validate(
-            model, val_loader, criterion, device, args, epoch
+            eval_model, val_loader, criterion, device, args, epoch
         )
         
         metrics = {**train_metrics, **val_metrics}
@@ -522,7 +620,7 @@ def main():
         # Save
         save_checkpoint(
             model, optimizer, scheduler, epoch,
-            metrics, checkpoint_dir, is_best
+            metrics, checkpoint_dir, is_best, ema=ema
         )
         
         print(f"  Best pAUC: {best_pauc:.4f} (Epoch {best_epoch})")

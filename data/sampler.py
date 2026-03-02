@@ -199,3 +199,109 @@ def get_weighted_sampler(dataset) -> WeightedRandomSampler:
         replacement=True,
     )
     return sampler
+
+
+class CurriculumSampler(Sampler):
+    """
+    Curriculum sampler with progressive hard-example mining.
+    
+    Phase 1 (warm-up): Uniform random sampling
+    Phase 2 (curriculum): Gradually increases sampling weight 
+                          for hard examples based on per-sample loss
+    
+    Usage:
+        sampler = CurriculumSampler(dataset, total_epochs=30)
+        # After each epoch:
+        sampler.update_losses(per_sample_losses)  # (N,) tensor
+        sampler.set_epoch(epoch)
+    """
+    
+    def __init__(
+        self,
+        dataset,
+        total_epochs: int = 30,
+        warmup_fraction: float = 0.2,
+        hard_fraction: float = 0.3,
+        oversample_pos: float = 2.0,
+    ):
+        self.dataset = dataset
+        self.total_epochs = total_epochs
+        self.warmup_epochs = int(total_epochs * warmup_fraction)
+        self.hard_fraction = hard_fraction
+        self.oversample_pos = oversample_pos
+        self.current_epoch = 0
+        
+        self.targets = np.array(dataset.targets)
+        self.n_samples = len(self.targets)
+        
+        # Per-sample loss (updated by trainer)
+        self.sample_losses = np.ones(self.n_samples, dtype=np.float32)
+        
+        self.pos_indices = np.where(self.targets == 1)[0]
+        self.neg_indices = np.where(self.targets == 0)[0]
+    
+    def set_epoch(self, epoch: int):
+        self.current_epoch = epoch
+    
+    def update_losses(self, losses: np.ndarray):
+        """Update per-sample losses for curriculum weighting."""
+        self.sample_losses = np.array(losses, dtype=np.float32)
+    
+    def __iter__(self) -> Iterator[int]:
+        if self.current_epoch < self.warmup_epochs:
+            # Warm-up: balanced random sampling
+            return self._uniform_iter()
+        else:
+            # Curriculum: bias toward hard examples
+            return self._curriculum_iter()
+    
+    def _uniform_iter(self) -> Iterator[int]:
+        # Oversample positives
+        n_pos = int(len(self.pos_indices) * self.oversample_pos)
+        pos = np.random.choice(self.pos_indices, size=n_pos, replace=True)
+        neg = np.random.choice(self.neg_indices, size=len(self.neg_indices), replace=False)
+        indices = np.concatenate([pos, neg])
+        np.random.shuffle(indices)
+        return iter(indices.tolist())
+    
+    def _curriculum_iter(self) -> Iterator[int]:
+        # Progress from warmup to end: 0→1
+        progress = (self.current_epoch - self.warmup_epochs) / max(
+            self.total_epochs - self.warmup_epochs, 1
+        )
+        progress = min(progress, 1.0)
+        
+        # Sampling weights: mix uniform + loss-proportional
+        uniform_weight = 1.0 - progress * self.hard_fraction
+        loss_weight = progress * self.hard_fraction
+        
+        weights = uniform_weight * np.ones_like(self.sample_losses)
+        
+        # Normalize losses to [0, 1] range
+        loss_min = self.sample_losses.min()
+        loss_max = self.sample_losses.max()
+        if loss_max > loss_min:
+            norm_losses = (self.sample_losses - loss_min) / (loss_max - loss_min)
+        else:
+            norm_losses = np.ones_like(self.sample_losses)
+        
+        weights += loss_weight * norm_losses
+        
+        # Extra boost for positive samples
+        weights[self.pos_indices] *= self.oversample_pos
+        
+        # Normalize to probabilities
+        weights /= weights.sum()
+        
+        indices = np.random.choice(
+            self.n_samples,
+            size=self.n_samples,
+            replace=True,
+            p=weights,
+        )
+        return iter(indices.tolist())
+    
+    def __len__(self) -> int:
+        if self.current_epoch < self.warmup_epochs:
+            return int(len(self.pos_indices) * self.oversample_pos) + len(self.neg_indices)
+        return self.n_samples
